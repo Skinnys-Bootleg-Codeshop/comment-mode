@@ -125,6 +125,36 @@ function runStorageContractSuite(label, createPlugin) {
       assert.deepEqual(loaded[0].replies, replies);
     });
 
+    test.it('a save that omits an earlier id never drops it', async function () {
+      // Each save call may legitimately be a snapshot from one reader who
+      // hasn't loaded every comment (see README "What the server behind this
+      // endpoint must do"). A plug-in that discards ids missing from the
+      // most recent save (correct newest-wins only among ids it happens to
+      // see together) would still pass every other test in this suite.
+      var pageReference = uniquePageReference('no-drop');
+      var plugin = await createPlugin();
+      var a = {
+        id: 'c6',
+        text: 'from reader A',
+        createdAt: '2024-01-01T00:00:00.000Z',
+        updatedAt: '2024-01-01T00:00:00.000Z'
+      };
+      var b = {
+        id: 'c7',
+        text: 'from reader B',
+        createdAt: '2024-01-01T00:01:00.000Z',
+        updatedAt: '2024-01-01T00:01:00.000Z'
+      };
+      await plugin.save(pageReference, [a]);
+      await plugin.save(pageReference, [b]); // b's save doesn't mention a
+      var loaded = await plugin.load(pageReference);
+      var byId = {};
+      loaded.forEach(function (c) { byId[c.id] = c; });
+      assert.equal(loaded.length, 2);
+      assert.equal(byId.c6.text, 'from reader A');
+      assert.equal(byId.c7.text, 'from reader B');
+    });
+
     test.it('a save to one page reference does not leak into another', async function () {
       var pageReference = uniquePageReference('isolation-a');
       var otherPageReference = uniquePageReference('isolation-b');

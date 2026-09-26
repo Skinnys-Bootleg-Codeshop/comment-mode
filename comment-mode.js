@@ -150,9 +150,19 @@
       );
     }
 
+    function loadUrl(pageReference) {
+      // Building the query string with the URL API (rather than string
+      // concatenation) is what keeps this correct when `endpoint` already
+      // has its own query string (e.g. an API key): `?pageReference=...`
+      // pasted onto an endpoint that already ends in `?key=abc` produces
+      // `...?key=abc?pageReference=...`, which most servers parse wrong.
+      var url = new URL(endpoint);
+      url.searchParams.set('pageReference', JSON.stringify(pageReference));
+      return url.toString();
+    }
+
     function load(pageReference) {
-      var url = endpoint + '?pageReference=' + encodeURIComponent(JSON.stringify(pageReference));
-      return fetchFn(url, { method: 'GET' }).then(function (res) {
+      return fetchFn(loadUrl(pageReference), { method: 'GET' }).then(function (res) {
         if (!res.ok) {
           throw new Error('Comment mode: web-address plug-in load failed with status ' + res.status);
         }
@@ -212,10 +222,26 @@
   // newer `updatedAt`, so it is never revived by an older record arriving
   // later; no special-case delete logic is needed here. Local ordering is
   // preserved; remote-only ids are appended at the end.
+  // A comment record must be an object with an `id` to participate in a
+  // merge at all. Storage the render path already treats defensively (see
+  // renderPin's own `!comment` check) can contain a stray `null` or an
+  // object missing `id`; without this guard, reading `.id` off such an
+  // entry throws, sync()'s catch sets needsSync, and every subsequent retry
+  // throws the same way forever, wedging sync permanently with no visible
+  // error. Skipping malformed entries here (from both local and remote,
+  // rather than keeping them in the merged/persisted result) is enough:
+  // there is nothing useful to keep from an entry with no id to merge by.
+  function isMergeableComment(value) {
+    return !!value && typeof value === 'object' && value.id !== undefined && value.id !== null;
+  }
+
   function mergeComments(local, remote) {
     var byId = {};
-    local.forEach(function (c) { byId[c.id] = c; });
+    local.forEach(function (c) {
+      if (isMergeableComment(c)) byId[c.id] = c;
+    });
     (remote || []).forEach(function (r) {
+      if (!isMergeableComment(r)) return;
       var existing = byId[r.id];
       if (!existing || incomingWinsTie(r, existing)) {
         byId[r.id] = r;
@@ -224,14 +250,14 @@
     var merged = [];
     var seen = {};
     local.forEach(function (c) {
+      if (!isMergeableComment(c) || seen[c.id]) return;
       merged.push(byId[c.id]);
       seen[c.id] = true;
     });
     (remote || []).forEach(function (r) {
-      if (!seen[r.id]) {
-        merged.push(byId[r.id]);
-        seen[r.id] = true;
-      }
+      if (!isMergeableComment(r) || seen[r.id]) return;
+      merged.push(byId[r.id]);
+      seen[r.id] = true;
     });
     return merged;
   }
@@ -1484,6 +1510,22 @@
       }
     }
 
+    // Looks up a comment by id in the *current* `comments` array. A comment
+    // captured when a pin was rendered (and so closed over by an edit
+    // sheet) can become detached from `comments` by the time Save/Delete
+    // actually runs: a sync reconcile (init sync, retry, or a subscribe
+    // push) replaces `comments` wholesale with freshly merged objects, so
+    // the old reference is no longer part of the array that gets persisted.
+    // Falling back to the captured object only when the id can no longer be
+    // found (which shouldn't happen: merges keep every local id, only ever
+    // tombstoning) keeps a stray edit from vanishing into a detached object.
+    function findCurrentComment(id) {
+      for (var i = 0; i < comments.length; i++) {
+        if (comments[i] && comments[i].id === id) return comments[i];
+      }
+      return null;
+    }
+
     function renderPins() {
       if (!ui) return;
       ui.pinsLayer.innerHTML = '';
@@ -1662,10 +1704,18 @@
           // it: `comments` (and what's persisted) keeps the entry, only
           // hidden from rendering (see renderPins). That's what makes a
           // deleted comment stay gone across a reload, since the marker
-          // itself is what gets loaded back.
-          comment.deleted = true;
-          comment.updatedAt = new Date().toISOString();
+          // itself is what gets loaded back. Mutate the *current* record
+          // (see findCurrentComment), not the one captured when the sheet
+          // opened, which a sync reconcile may have since detached from
+          // `comments`.
+          var live = findCurrentComment(comment.id) || comment;
+          live.deleted = true;
+          live.updatedAt = new Date().toISOString();
           saveComments(storageKey, comments);
+          // Browser-first, then sync: a delete is a mutation like any other
+          // and must reach the plug-in the same way create/edit do, not
+          // just sit in localStorage until the next unrelated sync.
+          syncEngine.save(comments);
           closeSheet();
           renderPins();
         });
@@ -1686,14 +1736,20 @@
         var text = textarea.value.trim();
         if (!text) return;
         if (isEdit) {
-          var changed = text !== comment.text || currentSentiment !== comment.sentiment;
+          // Mutate the *current* record (see findCurrentComment), not the
+          // one captured when the sheet opened: a sync reconcile that ran
+          // while the sheet was open (init sync, retry, or a subscribe
+          // push) may have replaced `comments` with freshly merged objects,
+          // detaching `comment` from the array that actually gets saved.
+          var live = findCurrentComment(comment.id) || comment;
+          var changed = text !== live.text || currentSentiment !== live.sentiment;
           if (!changed) {
             closeSheet();
             return;
           }
-          comment.text = text;
-          comment.sentiment = currentSentiment;
-          comment.updatedAt = new Date().toISOString();
+          live.text = text;
+          live.sentiment = currentSentiment;
+          live.updatedAt = new Date().toISOString();
         } else {
           var created = {
             id: Date.now() + '-' + Math.random().toString(16).slice(2),

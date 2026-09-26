@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="comment-mode:page-id" content="subscribe-throws-fixture">
+<title>Comment mode fixture: a plug-in whose subscribe() throws</title>
+</head>
+<body>
+  <main>
+    <p id="intro">This is the first sentence of the introduction. This is the second sentence of the introduction. Here is a third one for good measure.</p>
+  </main>
+  <script src="/comment-mode.js"></script>
+  <script>
+    // A plug-in whose subscribe() throws synchronously, standing in for a
+    // broken third-party implementation. init() must degrade to no push
+    // updates rather than let this take the whole module down (FOR-444
+    // review item 2/7).
+    window.commentModeInitError = null;
+    var plugin = {
+      load: function () { return Promise.resolve([]); },
+      save: function () { return Promise.resolve(); },
+      subscribe: function () {
+        throw new Error('this plug-in is broken');
+      }
+    };
+    try {
+      window.commentModeInstance = window.CommentMode.init({ storage: plugin });
+    } catch (e) {
+      window.commentModeInitError = e.message;
+    }
+  </script>
+</body>
+</html>

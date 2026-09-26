@@ -1394,3 +1394,113 @@ test.describe('storage plug-in subscribe wiring', () => {
     await expect.poll(pinCount).toBe(0);
   });
 });
+
+test.describe('delete syncs to the storage plug-in', () => {
+  // Regression test (FOR-444 review item 2): the delete handler used to
+  // mark the record and write to localStorage but never call into the sync
+  // engine, so a delete never reached the plug-in until some unrelated sync
+  // happened to run. Delete must go through the same browser-first-then-sync
+  // path create/edit do.
+  test('deleting a comment reaches the plug-in save with deleted: true', async ({ page }) => {
+    await page.goto('/test/fixtures/page-recording-plugin.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('Delete me via plug-in.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByRole('button', { name: 'Delete' }).tap();
+
+    const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
+    expect(lastSave).toHaveLength(1);
+    expect(lastSave[0].deleted).toBe(true);
+  });
+});
+
+test.describe('editing during a concurrent subscribe push', () => {
+  // Regression test (FOR-444 review item 3): the edit sheet closed over the
+  // specific comment object it opened with. A sync reconcile (here, a
+  // subscribe push) replaces `comments` with freshly merged objects, so an
+  // id that the push also reports (even alongside an unrelated new comment,
+  // since a push reports the plug-in's whole current array per the
+  // documented contract) gets a new object identity. Save/Delete must look
+  // the comment up by id in the current array, not mutate the now-detached
+  // captured object.
+  test('an edit made while a subscribe push lands mid-sheet still persists', async ({ page }) => {
+    await page.goto('/test/fixtures/page-recording-plugin.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('Original text.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.getByRole('button', { name: 'Exit comment mode', exact: true }).tap();
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await expect(page.locator('textarea')).toHaveValue('Original text.');
+
+    // While the edit sheet is open, a subscribe push arrives reporting the
+    // plug-in's current full state: a fresh (differently-identified) copy
+    // of the comment just saved, echoed back at the same updatedAt (so it
+    // wins the merge tie and replaces the local object), plus an unrelated
+    // new comment from another reader.
+    await page.evaluate(() => {
+      const pushed = JSON.parse(JSON.stringify(window.saveCalls[window.saveCalls.length - 1]));
+      pushed.push({
+        id: 'from-another-reader',
+        anchor: {
+          quote: {
+            exact: 'This is the second sentence of the introduction.',
+            prefix: '',
+            suffix: ''
+          }
+        },
+        text: 'unrelated new comment',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+      window.subscribeOnChange(pushed);
+    });
+
+    await page.locator('textarea').fill('Edited during a concurrent push.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+    await expect(page.locator('textarea')).toHaveCount(0);
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:recording-fixture'))
+    );
+    const edited = stored.find((c) => c.id !== 'from-another-reader');
+    expect(edited.text).toBe('Edited during a concurrent push.');
+  });
+});
+
+test.describe('a plug-in whose subscribe() throws', () => {
+  // Regression test (FOR-444 review item 7): subscribe() runs synchronously
+  // in init(), unlike load/save which run inside the sync engine's own
+  // promise chain, so a plug-in whose subscribe() throws used to take
+  // init() (and the whole module) down with it. It must degrade to no push
+  // updates instead.
+  test('the toggle still renders and a new comment still saves despite it', async ({ page }) => {
+    await page.goto('/test/fixtures/page-subscribe-throws.html');
+
+    const initError = await page.evaluate(() => window.commentModeInitError);
+    expect(initError).toBeNull();
+
+    await expect(page.getByRole('button', { name: 'Comment mode', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('Still works despite a broken subscribe.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await expect(page.locator('textarea')).toHaveCount(0);
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:subscribe-throws-fixture'))
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].text).toBe('Still works despite a broken subscribe.');
+  });
+});

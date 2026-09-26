@@ -168,6 +168,25 @@ test.describe('mergeComments', function () {
     var merged = mergeComments(local, remote);
     assert.equal(merged[0].text, 'remote');
   });
+
+  test.it('skips a malformed entry instead of throwing, in both local and remote', function () {
+    // The render path already treats stored comments defensively (renderPin
+    // skips `!comment`), so a stray `null` or an id-less object is expected
+    // to occur. Without this guard, reading `.id` off such an entry throws,
+    // sync()'s catch sets needsSync, and every subsequent retry throws the
+    // same way forever: sync is wedged with no visible error.
+    var local = [null, { text: 'no id at all' }, { id: '1', text: 'good local' }];
+    var remote = [undefined, 'not even an object', { id: '2', text: 'good remote' }];
+    var merged;
+    assert.doesNotThrow(function () {
+      merged = mergeComments(local, remote);
+    });
+    assert.equal(merged.length, 2);
+    var byId = {};
+    merged.forEach(function (c) { byId[c.id] = c; });
+    assert.equal(byId['1'].text, 'good local');
+    assert.equal(byId['2'].text, 'good remote');
+  });
 });
 
 test.describe('sync engine offline queueing and reconnect', function () {
