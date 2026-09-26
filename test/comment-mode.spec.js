@@ -754,6 +754,10 @@ test.describe('scopes', () => {
     await page.locator('textarea').fill('Nice mockup.');
     await page.getByRole('button', { name: 'Save' }).tap();
 
+    // An image carries no text a Range could be built from, so its pin is
+    // positioned by the anchor's stored `rel` (FOR-443): the fraction across
+    // the image's own rect where the tap landed, here its centre, not the
+    // image's top-left corner.
     async function pinOverImage() {
       return page.evaluate(() => {
         const host = document.querySelector('[data-comment-mode-host]');
@@ -762,7 +766,10 @@ test.describe('scopes', () => {
         const imgRect = img.getBoundingClientRect();
         return {
           pin: pin ? { left: parseFloat(pin.style.left), top: parseFloat(pin.style.top) } : null,
-          image: { left: imgRect.left + window.scrollX, top: imgRect.top + window.scrollY }
+          image: {
+            left: imgRect.left + imgRect.width / 2 + window.scrollX,
+            top: imgRect.top + imgRect.height / 2 + window.scrollY
+          }
         };
       });
     }
@@ -807,7 +814,13 @@ test.describe('scopes', () => {
       const decoy = document.getElementById('decoy-img').getBoundingClientRect();
       return {
         pin: pin ? { left: parseFloat(pin.style.left), top: parseFloat(pin.style.top) } : null,
-        target: { left: target.left + window.scrollX, top: target.top + window.scrollY },
+        // The tap landed on the image's centre; see the sibling image test
+        // above for why the pin is positioned there rather than the image's
+        // top-left corner.
+        target: {
+          left: target.left + target.width / 2 + window.scrollX,
+          top: target.top + target.height / 2 + window.scrollY
+        },
         decoy: { left: decoy.left + window.scrollX, top: decoy.top + window.scrollY }
       };
     });
@@ -818,6 +831,44 @@ test.describe('scopes', () => {
     // Guard against a coincidental pass: the decoy must actually be
     // elsewhere on the page, not overlapping the target.
     expect(Math.abs(rects.target.top - rects.decoy.top)).toBeGreaterThan(10);
+  });
+
+  test('an image anchor stored before rel existed still resolves to its image, at the top-left corner', async ({ page }) => {
+    // A comment saved by an older version of the module has no `rel` at
+    // all — positionForTarget must default it to the image's own top-left
+    // corner (as every image anchor was positioned before FOR-443), not
+    // throw or land at a NaN offset.
+    await page.addInitScript(() => {
+      localStorage.setItem(
+        'comment-mode:comments:scopes-fixture',
+        JSON.stringify([
+          {
+            id: 'legacy',
+            anchor: {
+              quote: { exact: '[image: A mockup screenshot]', prefix: '', suffix: '' },
+              scope: 'block',
+              path: 'main:nth-of-type(1) > img:nth-of-type(1)'
+            },
+            text: 'legacy anchor, no rel',
+            createdAt: new Date().toISOString()
+          }
+        ])
+      );
+    });
+    await page.goto('/test/fixtures/page-scopes.html');
+
+    const rect = await page.evaluate(() => {
+      const host = document.querySelector('[data-comment-mode-host]');
+      const pin = host.shadowRoot.querySelector('.cm-pin');
+      const img = document.getElementById('fixture-image').getBoundingClientRect();
+      return {
+        pin: pin ? { left: parseFloat(pin.style.left), top: parseFloat(pin.style.top) } : null,
+        image: { left: img.left + window.scrollX, top: img.top + window.scrollY }
+      };
+    });
+    expect(rect.pin).not.toBeNull();
+    expect(Math.abs(rect.pin.left - rect.image.left)).toBeLessThanOrEqual(5);
+    expect(Math.abs(rect.pin.top - rect.image.top)).toBeLessThanOrEqual(5);
   });
 });
 
@@ -1281,6 +1332,364 @@ test.describe('deleting a comment', () => {
     expect(stored).toHaveLength(1);
     expect(stored[0].deleted).toBe(true);
     expect(stored[0].text).toBe('Delete me.');
+  });
+});
+
+test.describe('re-anchoring, orphans and re-pin', () => {
+  // Extracts the same {pin, anchor} rect pair persistence-across-reload's
+  // pinAndAnchorRects uses, but against #detail's live text rather than a
+  // reload, since these tests re-anchor without ever navigating away.
+  async function pinAndDetailRect(page) {
+    return page.evaluate(() => {
+      const host = document.querySelector('[data-comment-mode-host]');
+      const pin = host.shadowRoot.querySelector('.cm-pin');
+      const stored = JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'));
+      const quote = stored[0].anchor.quote.exact;
+      const p = document.getElementById('detail');
+      const idx = p.textContent.indexOf(quote);
+      const textNode = Array.from(p.childNodes).find((n) => n.nodeType === 3 && n.nodeValue.includes(quote));
+      const range = document.createRange();
+      range.setStart(textNode, textNode.nodeValue.indexOf(quote));
+      range.setEnd(textNode, textNode.nodeValue.indexOf(quote) + quote.length);
+      const rect = range.getBoundingClientRect();
+      return {
+        pin: pin ? { left: parseFloat(pin.style.left), top: parseFloat(pin.style.top) } : null,
+        anchor: { left: rect.left + window.scrollX, top: rect.top + window.scrollY }
+      };
+    });
+  }
+
+  test('a pin stays correctly positioned on its text after the viewport resizes', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#detail').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width * 0.2, box.y + box.height / 2);
+    await page.locator('textarea').fill('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.setViewportSize({ width: 420, height: 860 });
+    // Re-anchoring on resize is debounced (120ms); give it room to fire.
+    await page.waitForTimeout(300);
+
+    const after = await pinAndDetailRect(page);
+    expect(after.pin).not.toBeNull();
+    expect(Math.abs(after.pin.left - after.anchor.left)).toBeLessThanOrEqual(5);
+    expect(Math.abs(after.pin.top - after.anchor.top)).toBeLessThanOrEqual(5);
+  });
+
+  test('a host re-render that keeps the anchored text intact keeps the pin, not orphaned, and moves it if the text moved', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#detail').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width * 0.2, box.y + box.height / 2);
+    await page.locator('textarea').fill('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    const pinBefore = await page.evaluate(() => {
+      const pin = document.querySelector('[data-comment-mode-host]').shadowRoot.querySelector('.cm-pin');
+      return { left: parseFloat(pin.style.left), top: parseFloat(pin.style.top) };
+    });
+
+    // Simulates a host re-rendering the same content into new elements (a
+    // React re-render, say) that also pushes it further down the page: the
+    // quote text survives, only the nodes it lives in (and their position)
+    // change. If re-anchoring didn't actually re-run, the pin would stay at
+    // its old, now-wrong position instead of following the text — the gap
+    // this test used to leave (see the FOR-443 review): wrapping the text in
+    // place without moving it left a stale pin indistinguishable from a
+    // correctly re-anchored one.
+    await page.evaluate(() => {
+      const p = document.getElementById('detail');
+      // A <p>, not a <div>: this fixture's own style-isolation rule forces
+      // every <div> to `position: absolute !important`, which would take a
+      // spacer <div> out of flow and push nothing down.
+      const spacer = document.createElement('p');
+      spacer.style.height = '400px';
+      p.parentNode.insertBefore(spacer, p);
+      p.innerHTML = '<span>' + p.textContent + '</span>';
+    });
+    await page.waitForTimeout(300);
+
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(1);
+    await expect(page.getByRole('button', { name: /Orphaned/ })).toHaveCount(0);
+
+    const after = await page.evaluate(() => {
+      const host = document.querySelector('[data-comment-mode-host]');
+      const pin = host.shadowRoot.querySelector('.cm-pin');
+      const stored = JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'));
+      const quote = stored[0].anchor.quote.exact;
+      const textNode = Array.from(document.getElementById('detail').querySelector('span').childNodes).find(
+        (n) => n.nodeType === 3
+      );
+      const idx = textNode.nodeValue.indexOf(quote);
+      const range = document.createRange();
+      range.setStart(textNode, idx);
+      range.setEnd(textNode, idx + quote.length);
+      const rect = range.getBoundingClientRect();
+      return {
+        pin: { left: parseFloat(pin.style.left), top: parseFloat(pin.style.top) },
+        text: { left: rect.left + window.scrollX, top: rect.top + window.scrollY }
+      };
+    });
+    expect(Math.abs(after.pin.top - pinBefore.top)).toBeGreaterThan(100);
+    expect(Math.abs(after.pin.left - after.text.left)).toBeLessThanOrEqual(5);
+    expect(Math.abs(after.pin.top - after.text.top)).toBeLessThanOrEqual(5);
+  });
+
+  test('rewriting a comment\'s anchored text orphans it and lists it in the orphan panel with its original quote', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#detail').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width * 0.2, box.y + box.height / 2);
+    await page.locator('textarea').fill('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    const quote = await page.evaluate(
+      () => JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))[0].anchor.quote.exact
+    );
+
+    // Rewrites the fixture text so the stored quote can no longer be found
+    // anywhere on the page, orphaning the comment (FOR-443's acceptance
+    // criterion: "Browser tests rewrite fixture text to create an orphan").
+    await page.evaluate(() => {
+      document.getElementById('detail').textContent = 'This paragraph now says something else entirely.';
+    });
+    await page.waitForTimeout(300);
+
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(0);
+    const orphanToggle = page.getByRole('button', { name: 'Orphaned (1)' });
+    await expect(orphanToggle).toBeVisible();
+    await orphanToggle.tap();
+
+    const panelQuote = await page
+      .locator('[data-comment-mode-host]')
+      .locator('.cm-orphan-quote')
+      .textContent();
+    expect(panelQuote).toContain(quote);
+  });
+
+  test('re-pinning an orphaned comment replaces its anchor and clears the orphan', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const detailBox = await page.locator('#detail').boundingBox();
+    if (!detailBox) throw new Error('missing bounding box');
+    await page.touchscreen.tap(detailBox.x + detailBox.width * 0.2, detailBox.y + detailBox.height / 2);
+    await page.locator('textarea').fill('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.evaluate(() => {
+      document.getElementById('detail').textContent = 'This paragraph now says something else entirely.';
+    });
+    await page.waitForTimeout(300);
+
+    await page.getByRole('button', { name: 'Orphaned (1)' }).tap();
+    await page.getByRole('button', { name: 'Re-pin' }).tap();
+
+    // Re-pinning re-enters placement mode: the next tap resolves a fresh
+    // anchor for the same comment, on #intro this time.
+    const introBox = await page.locator('#intro').boundingBox();
+    if (!introBox) throw new Error('missing bounding box');
+    await page.touchscreen.tap(introBox.x + 4, introBox.y + 4);
+
+    await expect(page.getByPlaceholder('Leave a comment…')).toHaveValue('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(1);
+    await expect(page.getByRole('button', { name: /Orphaned/ })).toHaveCount(0);
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].anchor.quote.exact).toContain('first sentence');
+    expect(stored[0].text).toBe('Where did this number come from?');
+  });
+
+  test('resolving an orphaned comment from the panel hides it there too', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#detail').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width * 0.2, box.y + box.height / 2);
+    await page.locator('textarea').fill('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.evaluate(() => {
+      document.getElementById('detail').textContent = 'This paragraph now says something else entirely.';
+    });
+    await page.waitForTimeout(300);
+
+    await page.getByRole('button', { name: 'Orphaned (1)' }).tap();
+    await page.getByRole('button', { name: 'Resolve' }).tap();
+
+    await expect(page.getByRole('button', { name: /Orphaned/ })).toHaveCount(0);
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored[0].resolved).toBe(true);
+  });
+
+  test('deleting an orphaned comment from the panel removes it from the panel', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#detail').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width * 0.2, box.y + box.height / 2);
+    await page.locator('textarea').fill('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.evaluate(() => {
+      document.getElementById('detail').textContent = 'This paragraph now says something else entirely.';
+    });
+    await page.waitForTimeout(300);
+
+    await page.getByRole('button', { name: 'Orphaned (1)' }).tap();
+    await page.getByRole('button', { name: 'Delete' }).tap();
+
+    await expect(page.getByRole('button', { name: /Orphaned/ })).toHaveCount(0);
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored[0].deleted).toBe(true);
+  });
+
+  test('deleting a comment while its re-pin is still pending abandons the re-pin, instead of writing onto the deleted record', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const detailBox = await page.locator('#detail').boundingBox();
+    if (!detailBox) throw new Error('missing bounding box');
+    await page.touchscreen.tap(detailBox.x + detailBox.width * 0.2, detailBox.y + detailBox.height / 2);
+    await page.locator('textarea').fill('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.evaluate(() => {
+      document.getElementById('detail').textContent = 'This paragraph now says something else entirely.';
+    });
+    await page.waitForTimeout(300);
+
+    await page.getByRole('button', { name: 'Orphaned (1)' }).tap();
+    await page.getByRole('button', { name: 'Re-pin' }).tap();
+    // Re-opening the panel while the re-pin is still pending (before ever
+    // tapping to complete it) and deleting the comment from there used to
+    // leave the re-pin armed against a now-deleted record (see the FOR-443
+    // review): the next tap would write a fresh anchor and new text onto a
+    // comment that never renders again.
+    await page.getByRole('button', { name: 'Orphaned (1)' }).tap();
+    await page.getByRole('button', { name: 'Delete' }).tap();
+
+    const introBox = await page.locator('#intro').boundingBox();
+    if (!introBox) throw new Error('missing bounding box');
+    await page.touchscreen.tap(introBox.x + 4, introBox.y + 4);
+    await page.locator('textarea').fill('A brand new comment.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(1);
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored).toHaveLength(2);
+    const deleted = stored.find((c) => c.deleted);
+    const created = stored.find((c) => !c.deleted);
+    expect(deleted.text).toBe('Where did this number come from?');
+    expect(created.text).toBe('A brand new comment.');
+  });
+
+  test('dismissing a re-pin sheet by tapping outside it abandons the re-pin', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const detailBox = await page.locator('#detail').boundingBox();
+    if (!detailBox) throw new Error('missing bounding box');
+    await page.touchscreen.tap(detailBox.x + detailBox.width * 0.2, detailBox.y + detailBox.height / 2);
+    await page.locator('textarea').fill('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.evaluate(() => {
+      document.getElementById('detail').textContent = 'This paragraph now says something else entirely.';
+    });
+    await page.waitForTimeout(300);
+
+    await page.getByRole('button', { name: 'Orphaned (1)' }).tap();
+    await page.getByRole('button', { name: 'Re-pin' }).tap();
+
+    const introBox = await page.locator('#intro').boundingBox();
+    if (!introBox) throw new Error('missing bounding box');
+    await page.touchscreen.tap(introBox.x + 4, introBox.y + 4);
+    await expect(page.getByPlaceholder('Leave a comment…')).toBeVisible();
+    // Dismisses the re-pin sheet by tapping elsewhere, the same "tap outside
+    // to dismiss" gesture used everywhere else — not the sheet's own Cancel
+    // button, which already cleared the re-pin before this fix.
+    await page.touchscreen.tap(introBox.x + 4, introBox.y + 4);
+    await expect(page.locator('textarea')).toHaveCount(0);
+
+    // A tap that should start an unrelated new comment must not still be
+    // consumed by the abandoned re-pin (see the FOR-443 review).
+    await page.touchscreen.tap(introBox.x + 4, introBox.y + 4);
+    await expect(page.getByPlaceholder('Leave a comment…')).toHaveValue('');
+    await page.locator('textarea').fill('An unrelated new comment.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored).toHaveLength(2);
+    expect(stored.some((c) => c.text === 'An unrelated new comment.')).toBe(true);
+    expect(stored.find((c) => c.text === 'Where did this number come from?').anchor.quote.exact).not.toContain(
+      'first sentence'
+    );
+  });
+
+  test('reopening a pin highlights its original sentence, not the whole paragraph', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    // Tap inside the second sentence of #intro, same as the sentence-scope
+    // test above, so the anchored quote is narrower than the paragraph.
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width * 0.55, box.y + box.height / 2);
+    await page.locator('textarea').fill('Source?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+
+    const result = await page.evaluate(() => {
+      const host = document.querySelector('[data-comment-mode-host]');
+      const highlights = Array.from(host.shadowRoot.querySelectorAll('.cm-highlight-box'));
+      const p = document.getElementById('intro');
+      const sentence = 'This is the second sentence of the introduction.';
+      const idx = p.textContent.indexOf(sentence);
+      const range = document.createRange();
+      range.setStart(p.firstChild, idx);
+      range.setEnd(p.firstChild, idx + sentence.length);
+      const sentenceRects = Array.from(range.getClientRects());
+      return {
+        highlights: highlights.map((h) => ({
+          left: parseFloat(h.style.left) - window.scrollX,
+          top: parseFloat(h.style.top) - window.scrollY,
+          width: parseFloat(h.style.width)
+        })),
+        sentenceRects: sentenceRects.map((r) => ({ left: r.left, top: r.top, width: r.width })),
+        paragraphRect: { left: p.getBoundingClientRect().left, top: p.getBoundingClientRect().top }
+      };
+    });
+    // Comparing against the sentence's own re-measured rects (not just "is
+    // it narrower than the paragraph") rules out a highlight that happens to
+    // be narrower for an unrelated reason, such as covering the whole
+    // paragraph's text minus its last, short line.
+    expect(result.highlights.length).toBe(result.sentenceRects.length);
+    expect(result.highlights.length).toBeGreaterThan(0);
+    result.highlights.forEach((box, i) => {
+      expect(Math.abs(box.left - result.sentenceRects[i].left)).toBeLessThanOrEqual(2);
+      expect(Math.abs(box.top - result.sentenceRects[i].top)).toBeLessThanOrEqual(2);
+      expect(Math.abs(box.width - result.sentenceRects[i].width)).toBeLessThanOrEqual(2);
+    });
+    // The sentence starts partway through the paragraph's own text, so its
+    // highlight must not start at the paragraph's own left edge either (the
+    // regression this test guards: outlining the whole block instead of the
+    // matched range).
+    expect(Math.abs(result.highlights[0].left - result.paragraphRect.left)).toBeGreaterThan(20);
   });
 });
 
