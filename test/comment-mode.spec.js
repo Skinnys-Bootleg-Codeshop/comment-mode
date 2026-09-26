@@ -1459,14 +1459,15 @@ test.describe('mutations sync to the storage plug-in', () => {
   });
 });
 
-test.describe('editing during a concurrent subscribe push', () => {
+test.describe('mutations during a concurrent subscribe push', () => {
   // Regression test (FOR-444 review item 3): the edit sheet closed over the
   // specific comment object it opened with. A sync reconcile (here, a
   // subscribe push) replaces `comments` with freshly merged objects, so an
   // id that the push also reports (even alongside an unrelated new comment,
   // since a push reports the plug-in's whole current array per the
-  // documented contract) gets a new object identity. Save/Delete must look
-  // the comment up by id in the current array, not mutate the now-detached
+  // documented contract) gets a new object identity. Every mutating action
+  // on a reopened sheet (edit, delete, resolve, reply) must look the
+  // comment up by id in the current array, not mutate the now-detached
   // captured object.
   test('an edit made while a subscribe push lands mid-sheet still persists', async ({ page }) => {
     await page.goto('/test/fixtures/page-recording-plugin.html');
@@ -1513,6 +1514,97 @@ test.describe('editing during a concurrent subscribe push', () => {
     );
     const edited = stored.find((c) => c.id !== 'from-another-reader');
     expect(edited.text).toBe('Edited during a concurrent push.');
+  });
+
+  // Shared setup for the delete/resolve/reply variants below: create a
+  // comment, reopen its pin, then trigger the same concurrent subscribe
+  // push (an echoed copy of the just-saved comment plus an unrelated new
+  // one) while the sheet is open. Every mutating action on the reopened
+  // sheet is exposed to the identical detachment risk edit is, so each gets
+  // the same race check: does the action land on the live record and reach
+  // the plug-in, or does it silently apply to the now-detached object the
+  // sheet opened with.
+  async function openCommentAndTriggerConcurrentPush(page, initialText) {
+    await page.goto('/test/fixtures/page-recording-plugin.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill(initialText);
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.getByRole('button', { name: 'Exit comment mode', exact: true }).tap();
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await expect(page.getByPlaceholder('Leave a comment…')).toHaveValue(initialText);
+
+    await page.evaluate(() => {
+      const pushed = JSON.parse(JSON.stringify(window.saveCalls[window.saveCalls.length - 1]));
+      pushed.push({
+        id: 'from-another-reader',
+        anchor: {
+          quote: {
+            exact: 'This is the second sentence of the introduction.',
+            prefix: '',
+            suffix: ''
+          }
+        },
+        text: 'unrelated new comment',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+      window.subscribeOnChange(pushed);
+    });
+  }
+
+  test('a delete made while a subscribe push lands mid-sheet still reaches localStorage and the plug-in', async ({ page }) => {
+    await openCommentAndTriggerConcurrentPush(page, 'Delete me despite a concurrent push.');
+
+    await page.getByRole('button', { name: 'Delete' }).tap();
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:recording-fixture'))
+    );
+    const target = stored.find((c) => c.id !== 'from-another-reader');
+    expect(target.deleted).toBe(true);
+
+    const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
+    const savedTarget = lastSave.find((c) => c.id !== 'from-another-reader');
+    expect(savedTarget.deleted).toBe(true);
+  });
+
+  test('a resolve made while a subscribe push lands mid-sheet still reaches localStorage and the plug-in', async ({ page }) => {
+    await openCommentAndTriggerConcurrentPush(page, 'Resolve me despite a concurrent push.');
+
+    await page.getByRole('button', { name: 'Resolve', exact: true }).tap();
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:recording-fixture'))
+    );
+    const target = stored.find((c) => c.id !== 'from-another-reader');
+    expect(target.resolved).toBe(true);
+
+    const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
+    const savedTarget = lastSave.find((c) => c.id !== 'from-another-reader');
+    expect(savedTarget.resolved).toBe(true);
+  });
+
+  test('a reply made while a subscribe push lands mid-sheet still reaches localStorage and the plug-in', async ({ page }) => {
+    await openCommentAndTriggerConcurrentPush(page, 'Reply to me despite a concurrent push.');
+
+    await page.getByPlaceholder('Reply…').fill('A reply that must survive the race.');
+    await page.getByRole('button', { name: 'Reply', exact: true }).tap();
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:recording-fixture'))
+    );
+    const target = stored.find((c) => c.id !== 'from-another-reader');
+    expect(target.replies).toHaveLength(1);
+    expect(target.replies[0].text).toBe('A reply that must survive the race.');
+
+    const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
+    const savedTarget = lastSave.find((c) => c.id !== 'from-another-reader');
+    expect(savedTarget.replies).toHaveLength(1);
+    expect(savedTarget.replies[0].text).toBe('A reply that must survive the race.');
   });
 });
 
