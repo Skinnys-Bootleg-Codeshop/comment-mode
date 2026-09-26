@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="comment-mode:page-id" content="subscribe-fixture">
+<title>Comment mode fixture: storage plug-in subscribe wiring</title>
+</head>
+<body>
+  <main>
+    <p id="intro">This is the first sentence of the introduction. This is the second sentence of the introduction. Here is a third one for good measure.</p>
+  </main>
+  <script src="/comment-mode.js"></script>
+  <script>
+    // A minimal plug-in whose subscribe() stashes the onChange callback on
+    // window, so the test can push updates through it directly and prove
+    // init() actually calls subscribe (FOR-444 review item 4).
+    window.subscribeOnChange = null;
+    var plugin = {
+      load: function () { return Promise.resolve([]); },
+      save: function () { return Promise.resolve(); },
+      subscribe: function (pageReference, onChange) {
+        window.subscribeOnChange = onChange;
+        return function unsubscribe() {};
+      }
+    };
+    window.commentModeInstance = window.CommentMode.init({ storage: plugin });
+  </script>
+</body>
+</html>

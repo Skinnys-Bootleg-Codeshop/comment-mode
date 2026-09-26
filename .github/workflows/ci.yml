@@ -19,3 +19,5 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm test
+        # npm test runs both the Playwright suite (test:browser, UI/anchoring)
+        # and the Node storage contract/sync-engine suite (test:node, FOR-444).

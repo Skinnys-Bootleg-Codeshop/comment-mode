@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="comment-mode:page-id" content="recording-fixture">
+<title>Comment mode fixture: storage plug-in save recording</title>
+</head>
+<body>
+  <main>
+    <p id="intro">This is the first sentence of the introduction. This is the second sentence of the introduction. Here is a third one for good measure.</p>
+  </main>
+  <script src="/comment-mode.js"></script>
+  <script>
+    // A plug-in that records every save() call (so a test can assert a
+    // mutation, including a delete, actually reaches the plug-in) and
+    // stashes its subscribe() onChange callback on window (so a test can
+    // drive a concurrent push while a sheet is open). load() always returns
+    // [] so it never itself changes what's on screen.
+    window.saveCalls = [];
+    window.subscribeOnChange = null;
+    var plugin = {
+      load: function () { return Promise.resolve([]); },
+      save: function (pageReference, comments) {
+        // A fresh, JSON round-tripped snapshot: a real plug-in serializes
+        // across a storage/network boundary, so what it later hands back
+        // through subscribe or load is never the same object identity
+        // comment mode passed in.
+        window.saveCalls.push(JSON.parse(JSON.stringify(comments)));
+        return Promise.resolve();
+      },
+      subscribe: function (pageReference, onChange) {
+        window.subscribeOnChange = onChange;
+        return function unsubscribe() {};
+      }
+    };
+    window.commentModeInstance = window.CommentMode.init({ storage: plugin });
+  </script>
+</body>
+</html>
