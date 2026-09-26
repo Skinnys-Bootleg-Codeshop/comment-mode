@@ -9,9 +9,11 @@
  * shape, and CONTEXT.md for the vocabulary used throughout (comment, anchor,
  * scope, comment mode, page reference, author).
  *
- * This is the tracer bullet (Linear FOR-439): sentence scope only, a
- * text-quote anchor (exact quote plus short prefix/suffix context), and
- * browser-only storage. FOR-441 added a sentiment picker, host-supplied
+ * Scope resolution supports word, sentence, block and section scopes (Linear
+ * FOR-440), stepped through with the sheet's −/+ controls; anchors are
+ * text-quote anchors (exact quote plus short prefix/suffix context, or a
+ * structural CSS path for image-like blocks with no text of their own), and
+ * storage is browser-only. FOR-441 added a sentiment picker, host-supplied
  * author/meta stamped onto new comments, and in-place editing and soft
  * delete from a comment's pin. FOR-442 added replies, resolve/reopen, and a
  * show-resolved switch. See CONTEXT.md and the ticket for what is
@@ -117,9 +119,27 @@
   // Flatten the text nodes under `root` into one string, remembering which
   // DOM text node backs each character range, so a plain-text offset can be
   // converted back into a DOM Range.
+  //
+  // Adjacent block-level containers (a <td> immediately followed by another
+  // <td>, an <li> followed by another <li>, ...) often have no whitespace
+  // text node between them in the markup, so flattening naively would run
+  // their content together into one word (e.g. "AlphaBeta"). Whenever the
+  // walk crosses from one grouping ancestor (nearestGroupingAncestor) into a
+  // different one, a single separator character is spliced into `text` with
+  // no backing entry of its own. `indexToNodeOffset`'s existing inclusive
+  // end-of-entry check (`index <= entry.end`) already resolves an index that
+  // lands on that separator to the end of the previous entry, so no other
+  // offset math needs to change.
+  //
+  // A <br> inside a block is a line break, not nothing: without a separator
+  // here, `<li>Line one<br>Line two</li>` would flatten to "Line oneLine
+  // two" with the two lines glued together.
   function buildTextIndex(root) {
     var entries = [];
     var text = '';
+    var previousGroup = null;
+    var blockCache = new Map();
+    var groupCache = new Map();
     var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode: function (node) {
         return isUnderSkippedAncestor(node)
@@ -131,10 +151,34 @@
     while ((node = walker.nextNode())) {
       var value = node.nodeValue;
       if (!value) continue;
+      var group = nearestGroupingAncestor(node.parentElement, blockCache, groupCache);
+      var brBefore = previousBrSibling(node);
+      if (
+        text.length &&
+        !/\s$/.test(text) &&
+        !/^\s/.test(value) &&
+        (brBefore || (previousGroup !== null && group !== previousGroup))
+      ) {
+        text += ' ';
+      }
       entries.push({ node: node, start: text.length, end: text.length + value.length });
       text += value;
+      previousGroup = group;
     }
     return { text: text, entries: entries };
+  }
+
+  // True when a <br> sits between `node` and the previous non-empty sibling
+  // content, within the same parent (a <br> at a container boundary is
+  // already covered by the grouping separator above).
+  function previousBrSibling(node) {
+    var sib = node.previousSibling;
+    while (sib) {
+      if (sib.nodeType === 1 && sib.tagName === 'BR') return true;
+      if (sib.nodeType === 3 && sib.nodeValue) return false;
+      sib = sib.previousSibling;
+    }
+    return false;
   }
 
   function indexToNodeOffset(index, entries) {
@@ -162,26 +206,142 @@
   }
 
   // ---------- block detection ----------
-  // Sentence resolution happens within the nearest block-level ancestor, so a
-  // sentence never bleeds across paragraph/heading/list-item boundaries.
+  // Sentence/word resolution happens within the nearest block-level
+  // ancestor, so a sentence never bleeds across paragraph/heading/list-item
+  // boundaries. IMG, FIGURE, SVG, CANVAS and VIDEO are here too, even though
+  // they carry no text of their own, so a tap on one of them resolves
+  // directly to it (block scope) rather than falling through to a
+  // text-bearing ancestor.
   var BLOCK_TAGS = [
-    'P', 'LI', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'TD', 'TH', 'BLOCKQUOTE', 'PRE'
+    'P', 'LI', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'TD', 'TH', 'BLOCKQUOTE', 'PRE',
+    'IMG', 'FIGURE', 'SVG', 'CANVAS', 'VIDEO'
   ];
 
-  function isBlockEl(el) {
-    if (!el || el.nodeType !== 1) return false;
-    if (BLOCK_TAGS.indexOf(el.tagName) !== -1) return true;
-    var display = global.getComputedStyle(el).display;
-    return display === 'block' || display === 'list-item' || display === 'table-cell';
+  // Tags whose block description falls back to a bracketed placeholder
+  // (`[image: alt]`, `[svg]`, ...) because they carry no text of their own
+  // that could ever be found by a quote search. IMG's description includes
+  // its alt text; the others don't have an equivalent human-authored label.
+  var IMAGE_LIKE_LABELS = { IMG: 'image', SVG: 'svg', CANVAS: 'canvas', VIDEO: 'video' };
+
+  // Cheap, per-element block test used on the hot per-text-node ancestor
+  // walk (nearestGroupingAncestor, and any actual-text tap): a tag-name
+  // lookup or a single getComputedStyle().display read, nothing that reads
+  // `textContent` or scans descendants. `cache` is a Map scoped to one
+  // buildTextIndex/resolveTap call, so a shared ancestor visited from many
+  // different text nodes is only ever computed once.
+  function isBlockTagOrDisplay(el, cache) {
+    if (!el || el.nodeType !== 1 || isCommentModeUI(el)) return false;
+    if (cache && cache.has(el)) return cache.get(el);
+    var result = BLOCK_TAGS.indexOf(el.tagName) !== -1;
+    if (!result) {
+      var display = global.getComputedStyle(el).display;
+      result = display === 'block' || display === 'list-item' || display === 'table-cell';
+    }
+    if (cache) cache.set(el, result);
+    return result;
   }
 
-  function findBlockAncestor(node) {
+  // A generic element (a plain <div>, <main>, ...) only counts as a block
+  // when it is a leaf of block-level structure with real content: a layout
+  // wrapper that itself contains further block-level elements (e.g. a
+  // <div class="page"> wrapping several paragraphs) must not be picked up as
+  // "the nearest block" ahead of those paragraphs, and an empty wrapper (a
+  // whitespace-only spacer <div>) must not be picked up as a block at all —
+  // both need to keep deferring to a real descendant block, or to
+  // distance-based resolution when there is none. Text nested inside inline
+  // children still counts as the wrapper's own content (`textContent`, not
+  // just direct child text nodes): a <div><span>...</span></div> is a
+  // perfectly ordinary block whose only child happens to be inline.
+  // Elements named explicitly in BLOCK_TAGS are always block regardless.
+  //
+  // This "leaf" rule is deliberately used only for the whitespace/distance
+  // fallback path (a tap that isn't on any real text): applying it to an
+  // actual text tap regressed a real case (a <div> that contains both loose
+  // text and a nested block, e.g. `<div><strong>Note:</strong> text <p>...
+  // </p></div>`) — the div stopped counting as a block at all because it
+  // "contains" the nested <p>, so a tap on the loose text fell through to
+  // the wrong element entirely. A real text tap instead walks up to the
+  // nearest ancestor `isBlockTagOrDisplay` recognises, regardless of what
+  // else that ancestor contains — the same rule this module used before
+  // FOR-440 introduced scopes.
+  function containsBlockDescendant(el) {
+    var all = el.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) {
+      var child = all[i];
+      if (BLOCK_TAGS.indexOf(child.tagName) !== -1) return true;
+      var d = global.getComputedStyle(child).display;
+      if (d === 'block' || d === 'list-item' || d === 'table-cell') return true;
+    }
+    return false;
+  }
+
+  function isBlockElLeaf(el) {
+    if (!el || el.nodeType !== 1 || isCommentModeUI(el)) return false;
+    if (BLOCK_TAGS.indexOf(el.tagName) !== -1) return true;
+    var display = global.getComputedStyle(el).display;
+    if (display !== 'block' && display !== 'list-item' && display !== 'table-cell') {
+      return false;
+    }
+    if (!/\S/.test(el.textContent)) return false;
+    return !containsBlockDescendant(el);
+  }
+
+  // `predicate` is the block test to use: `isBlockTagOrDisplay` for a tap
+  // that landed on real text (the original, non-leaf rule), or
+  // `isBlockElLeaf` for the whitespace/distance fallback path. See the
+  // comment on `containsBlockDescendant` above for why these differ.
+  function findBlockAncestor(node, predicate) {
     var el = node.nodeType === 3 ? node.parentElement : node;
     while (el && el !== document.body) {
-      if (isBlockEl(el)) return el;
+      if (predicate(el)) return el;
       el = el.parentElement;
     }
     return null;
+  }
+
+  // Every text node and every candidate block element is grouped under the
+  // nearest ancestor `isBlockTagOrDisplay` recognises (falling back to
+  // document.body), so buildTextIndex knows when it has crossed from one
+  // block-level container into another and needs to splice in a separator.
+  // `groupCache` memoizes the *result* of this walk per element (not just
+  // the per-element block test), so pages with many sibling text nodes under
+  // a shared ancestor chain resolve each ancestor's group at most once
+  // overall rather than once per text node.
+  function nearestGroupingAncestor(el, blockCache, groupCache) {
+    if (!el || el === document.body) return document.body;
+    if (groupCache && groupCache.has(el)) return groupCache.get(el);
+    var result = isBlockTagOrDisplay(el, blockCache)
+      ? el
+      : nearestGroupingAncestor(el.parentElement, blockCache, groupCache);
+    if (groupCache) groupCache.set(el, result);
+    return result;
+  }
+
+  function isCommentModeUI(el) {
+    return !!(el && el.nodeType === 1 && el.closest && el.closest('[data-comment-mode-host]'));
+  }
+
+  // Finds the block-level element nearest to a point that has no text
+  // directly under it (a tap that lands in whitespace, on a bare layout
+  // wrapper, or in the margin). Used only when neither a caret hit nor an
+  // element hit under the point resolves to a block directly.
+  function nearestBlockByDistance(root, clientX, clientY) {
+    var all = root.querySelectorAll('*');
+    var best = null;
+    var bestDistance = Infinity;
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (!isBlockElLeaf(el)) continue;
+      var rect = el.getBoundingClientRect();
+      var dx = Math.max(rect.left - clientX, 0, clientX - rect.right);
+      var dy = Math.max(rect.top - clientY, 0, clientY - rect.bottom);
+      var distance = Math.sqrt(dx * dx + dy * dy);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = el;
+      }
+    }
+    return best;
   }
 
   // ---------- sentence segmentation ----------
@@ -236,6 +396,142 @@
     return { start: 0, end: text.length, text: text };
   }
 
+  // ---------- word segmentation ----------
+  // Intl.Segmenter's word granularity treats a hyphen as its own (non-word-
+  // like) segment, splitting "well-known" into "well" / "-" / "known". A
+  // word scope must keep a hyphenated word whole, so after finding the base
+  // word-like segment at `idx`, we expand outward across any run of
+  // single-hyphen joins to word-like neighbours on either side. The ASCII
+  // hyphen-minus isn't the only character used this way in real text, so the
+  // non-breaking hyphen (U+2011) and standalone hyphen (U+2010) join too.
+  var HYPHEN_JOIN_CHARS = { '-': true, '‐': true, '‑': true };
+
+  // `idx` comes from a caret API and, like getSentenceAt, can legitimately
+  // equal `text.length` (tapping the very last character of a block reports
+  // an offset one past it). Without the same clamp-plus-adjacent-candidate
+  // handling getSentenceAt uses, that off-by-one silently fails to match any
+  // word segment and falls back to the whole block's text.
+  function getWordAt(text, idx) {
+    if (!text.length) return { start: 0, end: 0, text: '' };
+    var clamped = idx < 0 ? 0 : idx > text.length - 1 ? text.length - 1 : idx;
+    var candidates = clamped > 0 ? [clamped, clamped - 1] : [clamped];
+
+    if (typeof Intl !== 'undefined' && Intl.Segmenter) {
+      try {
+        var segments = Array.from(
+          new Intl.Segmenter(undefined, { granularity: 'word' }).segment(text)
+        );
+        for (var c = 0; c < candidates.length; c++) {
+          var pos = candidates[c];
+          var found = -1;
+          for (var i = 0; i < segments.length; i++) {
+            var seg = segments[i];
+            if (pos >= seg.index && pos < seg.index + seg.segment.length) {
+              found = i;
+              break;
+            }
+          }
+          if (found === -1) continue;
+          if (!segments[found].isWordLike) {
+            // Tapped a separator between words (e.g. the hyphen itself, or
+            // punctuation/space): prefer the nearest word-like segment.
+            var before = -1;
+            for (var b = found - 1; b >= 0; b--) {
+              if (segments[b].isWordLike) { before = b; break; }
+            }
+            var after = -1;
+            for (var f = found + 1; f < segments.length; f++) {
+              if (segments[f].isWordLike) { after = f; break; }
+            }
+            found = before !== -1 ? before : after;
+          }
+          if (found === -1) continue;
+          var startIdx = found;
+          var endIdx = found;
+          while (
+            startIdx > 1 &&
+            HYPHEN_JOIN_CHARS[segments[startIdx - 1].segment] &&
+            segments[startIdx - 2].isWordLike
+          ) {
+            startIdx -= 2;
+          }
+          while (
+            endIdx < segments.length - 2 &&
+            HYPHEN_JOIN_CHARS[segments[endIdx + 1].segment] &&
+            segments[endIdx + 2].isWordLike
+          ) {
+            endIdx += 2;
+          }
+          var start = segments[startIdx].index;
+          var end = segments[endIdx].index + segments[endIdx].segment.length;
+          return { start: start, end: end, text: text.slice(start, end) };
+        }
+      } catch (e) {
+        // fall through to the regex fallback below
+      }
+    }
+
+    for (var c2 = 0; c2 < candidates.length; c2++) {
+      var pos2 = candidates[c2];
+      var re2 = /\S+/g;
+      var m;
+      while ((m = re2.exec(text))) {
+        if (pos2 >= m.index && pos2 < m.index + m[0].length) {
+          return { start: m.index, end: m.index + m[0].length, text: m[0] };
+        }
+      }
+    }
+    return { start: 0, end: text.length, text: text };
+  }
+
+  // ---------- section scope ----------
+  // A section is not a tagged region: it is the span from the nearest
+  // heading at or before a block up to (but not including) the next heading
+  // of equal or shallower level — the same "heading-delimited region"
+  // definition as the reference prototype (see FOR-440's ticket notes). A
+  // block before any heading, or a page with no headings at all, is its own
+  // section running from the top of the page to the first heading (or the
+  // whole page).
+  function isBefore(a, b) {
+    return !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+  }
+
+  function getHeadings() {
+    var all = document.body.querySelectorAll('h1, h2, h3, h4, h5, h6');
+    var headings = [];
+    for (var i = 0; i < all.length; i++) {
+      if (!isCommentModeUI(all[i])) headings.push(all[i]);
+    }
+    return headings;
+  }
+
+  function getSectionRange(block) {
+    var headings = getHeadings();
+    var start = null;
+    for (var i = 0; i < headings.length; i++) {
+      var h = headings[i];
+      if (h === block || isBefore(h, block)) {
+        start = h;
+      } else {
+        break;
+      }
+    }
+    var level = start ? parseInt(start.tagName.charAt(1), 10) : 0;
+    var end = null;
+    if (start) {
+      var startIndex = headings.indexOf(start);
+      for (var j = startIndex + 1; j < headings.length; j++) {
+        if (parseInt(headings[j].tagName.charAt(1), 10) <= level) {
+          end = headings[j];
+          break;
+        }
+      }
+    } else {
+      end = headings[0] || null;
+    }
+    return { start: start, end: end };
+  }
+
   // ---------- tap resolution ----------
   function getCaretAt(clientX, clientY) {
     if (document.caretPositionFromPoint) {
@@ -280,8 +576,8 @@
   // A tap only counts as "on text" when the point actually falls inside the
   // rect of a real character near the caret API's guess, not just near it
   // (the caret APIs happily return the nearest text even for taps in blank
-  // margins). The whitespace/block fallback for those taps is a later
-  // ticket's scope, not this one: we simply do nothing.
+  // margins). resolveTap below is what handles a tap that isn't on text —
+  // an element hit, or the nearest block by distance, flagged `near`.
   //
   // The caret API reports `offset` based on which side of a glyph's midpoint
   // the point falls on: a tap on the right half of a character can come back
@@ -304,53 +600,211 @@
     return false;
   }
 
-  // Resolves a tap point to the sentence it lands on, and the exact quote +
-  // prefix/suffix context (relative to the whole page's flattened text) that
-  // makes up its text-quote anchor. Returns null when the tap isn't on text.
-  function resolveTapToAnchor(clientX, clientY) {
+  // Resolves a tap point to everything scope resolution needs: the block it
+  // landed in (directly, or the nearest one for a whitespace tap), the exact
+  // text position when the tap landed on a real character, and the ordered
+  // list of scopes the −/+ controls can step through from here. Returns null
+  // when nothing block-level can be found at all (an empty document).
+  //
+  // A tap that isn't on a character resolves through the topmost element
+  // under the point (elementsFromPoint, not the caret APIs — those always
+  // return their nearest text guess even for a tap far from any character).
+  // When that element isn't block-level either (a bare layout wrapper, or
+  // nothing at all under the point), the nearest block by distance is used
+  // and the anchor is flagged `near`, since it doesn't actually contain the
+  // tapped point.
+  function resolveTap(clientX, clientY) {
     var caret = getCaretAt(clientX, clientY);
-    if (!caret || !pointIsOnCharacter(caret.node, caret.offset, clientX, clientY)) {
-      return null;
+    var onText = !!(caret && pointIsOnCharacter(caret.node, caret.offset, clientX, clientY));
+    var textNode = onText ? caret.node : null;
+    var textOffset = onText ? caret.offset : null;
+
+    var block = null;
+    if (onText) {
+      // Real text tap: the original, non-leaf block rule (see the comment on
+      // `containsBlockDescendant`).
+      block = findBlockAncestor(textNode, isBlockTagOrDisplay);
+      if (!block) onText = false;
     }
-    var block = findBlockAncestor(caret.node);
+
+    var near = false;
+    if (!onText) {
+      var elems = document.elementsFromPoint ? document.elementsFromPoint(clientX, clientY) : [];
+      var topEl = null;
+      for (var i = 0; i < elems.length; i++) {
+        if (elems[i].nodeType === 1 && !isCommentModeUI(elems[i])) {
+          topEl = elems[i];
+          break;
+        }
+      }
+      // No real text under the tap: the stricter leaf rule, so a bare layout
+      // wrapper still defers to a real descendant block.
+      block = topEl ? findBlockAncestor(topEl, isBlockElLeaf) : null;
+      if (!block) {
+        block = nearestBlockByDistance(document.body, clientX, clientY);
+        near = true;
+      }
+    }
     if (!block) return null;
 
-    var blockIndex = buildTextIndex(block);
-    var localOffset = null;
-    for (var i = 0; i < blockIndex.entries.length; i++) {
-      var entry = blockIndex.entries[i];
-      if (entry.node === caret.node) {
-        localOffset = entry.start + Math.min(caret.offset, caret.node.nodeValue.length);
-        break;
-      }
-    }
-    if (localOffset === null) return null;
+    var levels = onText ? ['word', 'sentence', 'block', 'section'] : ['block', 'section'];
+    var defaultScope = onText ? 'sentence' : 'block';
+    return {
+      block: block,
+      textNode: textNode,
+      textOffset: textOffset,
+      onText: onText,
+      near: near,
+      levels: levels,
+      levelIndex: levels.indexOf(defaultScope)
+    };
+  }
 
-    var sentence = getSentenceAt(blockIndex.text, localOffset);
-    var range = rangeForOffsets(blockIndex.entries, sentence.start, sentence.end);
-    if (!range) return null;
-
-    var pageIndex = buildTextIndex(document.body);
+  // Converts a DOM Range's boundaries into offsets in a page-wide flattened
+  // text index (see buildTextIndex), by matching the range's start/end
+  // containers against the index's entries. Returns null when either
+  // boundary's text node isn't in the index (e.g. the range came from a
+  // detached or filtered-out node).
+  function globalOffsetsForRange(range, pageIndex) {
     var globalStart = null;
     var globalEnd = null;
-    var startInfo = { node: range.startContainer, offset: range.startOffset };
-    var endInfo = { node: range.endContainer, offset: range.endOffset };
-    for (var j = 0; j < pageIndex.entries.length; j++) {
-      var e = pageIndex.entries[j];
-      if (e.node === startInfo.node && globalStart === null) {
-        globalStart = e.start + startInfo.offset;
+    for (var i = 0; i < pageIndex.entries.length; i++) {
+      var entry = pageIndex.entries[i];
+      if (entry.node === range.startContainer && globalStart === null) {
+        globalStart = entry.start + range.startOffset;
       }
-      if (e.node === endInfo.node) {
-        globalEnd = e.start + endInfo.offset;
+      if (entry.node === range.endContainer) {
+        globalEnd = entry.start + range.endOffset;
       }
     }
     if (globalStart === null || globalEnd === null) return null;
+    return { start: globalStart, end: globalEnd };
+  }
 
-    var exact = pageIndex.text.slice(globalStart, globalEnd);
-    var prefix = pageIndex.text.slice(Math.max(0, globalStart - CONTEXT_CHARS), globalStart);
-    var suffix = pageIndex.text.slice(globalEnd, globalEnd + CONTEXT_CHARS);
+  // Builds the {quote, near} anchor for a [start, end) span of a page-wide
+  // flattened text, trimming any leading/trailing whitespace first —
+  // including a buildTextIndex-inserted separator that happened to fall at
+  // the very edge of the span (e.g. a block-scope quote that starts right at
+  // a preceding cell/item boundary).
+  function buildQuoteAnchor(text, start, end, near) {
+    var s = start;
+    var e = end;
+    while (s < e && /\s/.test(text[s])) s++;
+    while (e > s && /\s/.test(text[e - 1])) e--;
+    var anchor = {
+      quote: {
+        exact: text.slice(s, e),
+        prefix: text.slice(Math.max(0, s - CONTEXT_CHARS), s),
+        suffix: text.slice(e, e + CONTEXT_CHARS)
+      }
+    };
+    if (near) anchor.near = true;
+    return anchor;
+  }
 
-    return { range: range, quote: { exact: exact, prefix: prefix, suffix: suffix } };
+  // A structural fallback locator for an anchor whose quote text can't be
+  // searched for on the page at all (an image's bracketed description isn't
+  // literally there). `:nth-of-type` at each level, from document.body down,
+  // is stable across reloads as long as the page's markup doesn't change.
+  function cssPathFromBody(el) {
+    var path = [];
+    var node = el;
+    while (node && node !== document.body && node.parentElement) {
+      var tag = node.tagName.toLowerCase();
+      var index = 1;
+      var sibling = node;
+      while ((sibling = sibling.previousElementSibling)) {
+        if (sibling.tagName === node.tagName) index++;
+      }
+      path.unshift(tag + ':nth-of-type(' + index + ')');
+      node = node.parentElement;
+    }
+    return path.join(' > ');
+  }
+
+  // Resolves the anchor for one scope, given the context resolveTap
+  // produced. Returns null when the scope can't be resolved (should not
+  // normally happen for a scope resolveTap actually offered).
+  function computeAnchorForScope(context, scope) {
+    var pageIndex = buildTextIndex(document.body);
+
+    if (scope === 'word' || scope === 'sentence') {
+      var blockIndex = buildTextIndex(context.block);
+      var localOffset = null;
+      for (var i = 0; i < blockIndex.entries.length; i++) {
+        var entry = blockIndex.entries[i];
+        if (entry.node === context.textNode) {
+          localOffset = entry.start + Math.min(context.textOffset, context.textNode.nodeValue.length);
+          break;
+        }
+      }
+      if (localOffset === null) return null;
+      var seg = scope === 'word' ? getWordAt(blockIndex.text, localOffset) : getSentenceAt(blockIndex.text, localOffset);
+      var range = rangeForOffsets(blockIndex.entries, seg.start, seg.end);
+      if (!range) return null;
+      var globals = globalOffsetsForRange(range, pageIndex);
+      if (!globals) return null;
+      var anchor = buildQuoteAnchor(pageIndex.text, globals.start, globals.end, false);
+      anchor.scope = scope;
+      return anchor;
+    }
+
+    if (scope === 'block') {
+      var blockEntries = pageIndex.entries.filter(function (e) {
+        return context.block.contains(e.node);
+      });
+      if (!blockEntries.length) {
+        // A block with no text of its own (an image, an inline SVG/canvas/
+        // video chart, or a wrapper around one): describe it instead of
+        // anchoring to text that isn't there, and carry a CSS path to the
+        // element itself, since the quote text search resolveAnchorRect and
+        // locateAnchor otherwise rely on can never match a description that
+        // isn't literally on the page.
+        var imageLikeSelector = Object.keys(IMAGE_LIKE_LABELS).join(',');
+        var imageLike = IMAGE_LIKE_LABELS[context.block.tagName]
+          ? context.block
+          : context.block.querySelector && context.block.querySelector(imageLikeSelector);
+        var label = imageLike ? IMAGE_LIKE_LABELS[imageLike.tagName] : 'untitled';
+        var description =
+          imageLike && imageLike.tagName === 'IMG'
+            ? '[image: ' + (imageLike.getAttribute('alt') || 'untitled') + ']'
+            : imageLike
+            ? '[' + label + ']'
+            : '[untitled]';
+        var blockAnchor = {
+          quote: { exact: description, prefix: '', suffix: '' },
+          scope: 'block',
+          path: cssPathFromBody(context.block)
+        };
+        if (context.near) blockAnchor.near = true;
+        return blockAnchor;
+      }
+      var blockAnchor2 = buildQuoteAnchor(
+        pageIndex.text,
+        blockEntries[0].start,
+        blockEntries[blockEntries.length - 1].end,
+        context.near
+      );
+      blockAnchor2.scope = 'block';
+      return blockAnchor2;
+    }
+
+    // section
+    var sectionRange = getSectionRange(context.block);
+    var sectionEntries = pageIndex.entries.filter(function (e) {
+      var afterStart = !sectionRange.start || isBefore(sectionRange.start, e.node);
+      var beforeEnd = !sectionRange.end || isBefore(e.node, sectionRange.end);
+      return afterStart && beforeEnd;
+    });
+    if (!sectionEntries.length) return null;
+    var sectionAnchor = buildQuoteAnchor(
+      pageIndex.text,
+      sectionEntries[0].start,
+      sectionEntries[sectionEntries.length - 1].end,
+      context.near
+    );
+    sectionAnchor.scope = 'section';
+    return sectionAnchor;
   }
 
   // ---------- locating a stored anchor back on the page ----------
@@ -385,9 +839,12 @@
 
   // Finds the current DOM Range for a stored quote anchor. When the exact
   // quote occurs more than once on the page, the occurrence whose
-  // surrounding text best matches the stored prefix/suffix wins.
-  function locateAnchor(quote) {
-    var pageIndex = buildTextIndex(document.body);
+  // surrounding text best matches the stored prefix/suffix wins. `pageIndex`
+  // is optional — callers rendering many pins in one pass (renderPins)
+  // build it once and pass it in, rather than each pin rebuilding a
+  // whole-page index from scratch.
+  function locateAnchor(quote, pageIndex) {
+    pageIndex = pageIndex || buildTextIndex(document.body);
     var occurrences = findAllOccurrences(pageIndex.text, quote.exact);
     if (occurrences.length === 0) return null;
 
@@ -407,6 +864,39 @@
     }
 
     return rangeForOffsets(pageIndex.entries, position, position + quote.exact.length);
+  }
+
+  // Finds where a stored anchor currently is on the page, as a rect a pin
+  // can be placed at. Quote text is tried first (locateAnchor); an anchor
+  // with no text of its own (an image's `[image: ...]` description can never
+  // match a text search, since it isn't literally on the page) falls back to
+  // its stored CSS path instead, using the element's own rect rather than a
+  // Range — `Range.selectNodeContents` on a childless element like <img>
+  // produces a zero-size range regardless of how large the image actually
+  // renders.
+  //
+  // `anchor.path` is built (cssPathFromBody) as a chain of `tag:nth-of-type`
+  // steps joined by `>`, relative to document.body — but `body.querySelector`
+  // matches that selector chain anywhere in the document, not only when its
+  // first step is a direct child of body. Two images under structurally
+  // similar ancestors (e.g. both the first `div` of their respective
+  // parents) can produce the same `div:nth-of-type(1) > img:nth-of-type(1)`
+  // path and collide. `:scope > ` anchors the first step to an actual direct
+  // child of body, matching how the path was built.
+  function resolveAnchorRect(anchor, pageIndex) {
+    if (anchor && anchor.quote && typeof anchor.quote.exact === 'string' && anchor.quote.exact) {
+      var range = locateAnchor(anchor.quote, pageIndex);
+      if (range) return range.getBoundingClientRect();
+    }
+    if (anchor && anchor.path) {
+      try {
+        var el = document.body.querySelector(':scope > ' + anchor.path);
+        if (el) return el.getBoundingClientRect();
+      } catch (e) {
+        // malformed/stale path: fall through to "not found"
+      }
+    }
+    return null;
   }
 
   // ---------- shadow DOM UI ----------
@@ -475,6 +965,24 @@
     '  padding: 16px;',
     '  max-height: 70vh;',
     '  overflow-y: auto;',
+    '}',
+    '.cm-scope-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }',
+    '.cm-scope-row button {',
+    '  min-width: 36px;',
+    '  min-height: 36px;',
+    '  padding: 0;',
+    '  border-radius: 8px;',
+    '  border: 1px solid #ccc;',
+    '  background: #f3f4f6;',
+    '  font: inherit;',
+    '  cursor: pointer;',
+    '}',
+    '.cm-scope-row button:disabled { opacity: 0.4; cursor: default; }',
+    '.cm-scope-label {',
+    '  font-size: 0.8rem;',
+    '  color: #666;',
+    '  text-transform: uppercase;',
+    '  letter-spacing: 0.04em;',
     '}',
     '.cm-quote {',
     '  font-size: 0.85rem;',
@@ -648,7 +1156,7 @@
       return text.length > max ? text.slice(0, max - 1) + '…' : text;
     }
 
-    function renderPin(comment) {
+    function renderPin(comment, pageIndex) {
       // A single malformed stored comment (missing/invalid anchor, e.g. from
       // a future format or manual tampering) must not abort rendering the
       // rest, nor abort init() itself — skip it instead.
@@ -661,10 +1169,8 @@
         ) {
           return;
         }
-        var range = locateAnchor(comment.anchor.quote);
-        if (!range) return; // re-anchoring beyond an exact-match lookup is later scope
-        var rect = range.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) return;
+        var rect = resolveAnchorRect(comment.anchor, pageIndex);
+        if (!rect || (rect.width === 0 && rect.height === 0)) return;
         var pin = document.createElement('div');
         pin.className = 'cm-pin';
         pin.title = comment.text;
@@ -688,6 +1194,10 @@
     function renderPins() {
       if (!ui) return;
       ui.pinsLayer.innerHTML = '';
+      // Build the page-wide text index once for the whole batch of pins,
+      // rather than once per stored comment — with many comments on a large
+      // page, rebuilding it per comment was the dominant cost of a re-render.
+      var pageIndex = buildTextIndex(document.body);
       // A deleted comment stays in storage (see openSheet's delete handler)
       // but is never rendered, so it's never shown in any list either. A
       // resolved comment stays too, but is only rendered when the
@@ -695,29 +1205,91 @@
       comments.forEach(function (comment) {
         if (comment && comment.deleted) return;
         if (comment && comment.resolved && !showResolved) return;
-        renderPin(comment);
+        renderPin(comment, pageIndex);
       });
     }
 
     // `mode` is 'create' (placing a new comment on a freshly resolved
-    // anchor) or 'edit' (reopened from an existing comment's pin, to change
-    // its text/sentiment or delete it). Both share one sheet: the anchor
-    // quote is always read-only display, never itself editable (scope
-    // resize is later ticket scope), only the text and sentiment change.
+    // anchor, where `data.context` is what resolveTap produced — the tapped
+    // block/position and the ordered list of scopes available from here) or
+    // 'edit' (reopened from an existing comment's pin, to change its
+    // text/sentiment or delete it). There's no `context` in edit mode, so
+    // the −/+ scope controls are disabled there: the anchor quote is always
+    // read-only display, never itself editable on an existing comment
+    // (scope resize is later ticket scope). The −/+ controls, when enabled,
+    // only ever move `context.levelIndex` and recompute the anchor for the
+    // new scope; they never re-resolve the original tap.
     function openSheet(mode, data) {
       closeSheet();
       var isEdit = mode === 'edit';
       var comment = isEdit ? data.comment : null;
+      var context = isEdit ? null : data.context;
       var anchor = isEdit ? comment.anchor : data.anchor;
       pendingAnchor = anchor;
 
       var sheet = document.createElement('div');
       sheet.className = 'cm-sheet';
 
+      var scopeRow = document.createElement('div');
+      scopeRow.className = 'cm-scope-row';
+
+      var narrow = document.createElement('button');
+      narrow.type = 'button';
+      narrow.setAttribute('aria-label', 'Narrow scope');
+      narrow.textContent = '−';
+      scopeRow.appendChild(narrow);
+
+      var scopeLabel = document.createElement('span');
+      scopeLabel.className = 'cm-scope-label';
+      scopeRow.appendChild(scopeLabel);
+
+      var widen = document.createElement('button');
+      widen.type = 'button';
+      widen.setAttribute('aria-label', 'Widen scope');
+      widen.textContent = '+';
+      scopeRow.appendChild(widen);
+
+      sheet.appendChild(scopeRow);
+
       var quote = document.createElement('p');
       quote.className = 'cm-quote';
-      quote.textContent = '“' + truncate(anchor.quote.exact, 160) + '”';
       sheet.appendChild(quote);
+
+      function refresh() {
+        if (context) {
+          scopeLabel.textContent = context.levels[context.levelIndex];
+          narrow.disabled = context.levelIndex === 0;
+          widen.disabled = context.levelIndex === context.levels.length - 1;
+        } else {
+          // Edit mode has no context to step through: the scope an existing
+          // comment was created with is fixed, so just display it.
+          scopeLabel.textContent = pendingAnchor.scope || '';
+          narrow.disabled = true;
+          widen.disabled = true;
+        }
+        var text = '“' + truncate(pendingAnchor.quote.exact, 160) + '”';
+        if (pendingAnchor.near) text += ' (near)';
+        quote.textContent = text;
+      }
+
+      // Narrow (-1) and widen (+1) only ever differ in direction; both move
+      // context.levelIndex and recompute the anchor for the new scope. A
+      // no-op (no `context`, i.e. edit mode) since the buttons are disabled.
+      function step(delta) {
+        if (!context) return;
+        var nextIndex = context.levelIndex + delta;
+        if (nextIndex < 0 || nextIndex > context.levels.length - 1) return;
+        var next = computeAnchorForScope(context, context.levels[nextIndex]);
+        if (!next) return;
+        context.levelIndex = nextIndex;
+        pendingAnchor = next;
+        refresh();
+      }
+
+      narrow.addEventListener('click', function () { step(-1); });
+      widen.addEventListener('click', function () { step(1); });
+
+      refresh();
 
       // Created up front (hidden when not resolved) rather than only on a
       // resolved comment, so the resolve/reopen handler below can toggle its
@@ -832,7 +1404,7 @@
         } else {
           var created = {
             id: Date.now() + '-' + Math.random().toString(16).slice(2),
-            anchor: { quote: anchor.quote },
+            anchor: pendingAnchor,
             text: text,
             sentiment: currentSentiment,
             createdAt: new Date().toISOString()
@@ -959,9 +1531,11 @@
           closeSheet();
           return;
         }
-        var anchor = resolveTapToAnchor(e.clientX, e.clientY);
+        var context = resolveTap(e.clientX, e.clientY);
+        if (!context) return;
+        var anchor = computeAnchorForScope(context, context.levels[context.levelIndex]);
         if (!anchor) return;
-        openSheet('create', { anchor: anchor });
+        openSheet('create', { context: context, anchor: anchor });
       },
       { capture: true }
     );

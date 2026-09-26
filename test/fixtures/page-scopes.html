@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="comment-mode:page-id" content="scopes-fixture">
+<title>Comment mode scopes fixture</title>
+</head>
+<body>
+<main>
+  <h1 id="h1-top">Report</h1>
+  <p id="hyphen-para">This is a well-known result worth noting.</p>
+  <div id="span-wrapped"><span id="span-wrapped-text">All of this text is inside a span.</span></div>
+
+  <h2 id="h2-evidence">Evidence</h2>
+  <p id="evidence-para">Some supporting detail goes here.</p>
+  <table id="evidence-table"><tbody><tr><td id="cell-a">Alpha</td><td id="cell-b">Beta</td></tr></tbody></table>
+  <ul id="evidence-list"><li id="item-a">First item</li><li id="item-b">Second item</li></ul>
+  <pre id="code-block">const x = 1;
+const y = 2;</pre>
+  <p id="tail-word">Hello world</p>
+
+  <h2 id="h2-wrapper">Wrapper</h2>
+  <!-- Regression fixture for FOR-440 review finding #2: a <div> that has
+       both loose text of its own AND a nested block child. A tap on the
+       loose text must anchor to it via the div (the nearest block ancestor
+       that isn't a leaf), not fall through to the nested paragraph. -->
+  <div id="loose-text-wrapper"><strong>Note:</strong> Remember this rule. <p id="nested-in-wrapper">Other paragraph.</p></div>
+
+  <h2 id="h2-visuals">Visuals</h2>
+  <img id="fixture-image" alt="A mockup of the digest email" width="200" height="100" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='100'%3E%3Crect width='200' height='100' fill='%23ccc'/%3E%3C/svg%3E">
+
+  <h2 id="h2-gallery">Gallery</h2>
+  <!-- Regression fixture for FOR-440 review finding #3: a decoy image whose
+       own local <div> > <img> pair is (nth-of-type(1) > nth-of-type(1)),
+       nested a couple of levels deeper, positioned earlier in document order
+       than #colliding-img below. #colliding-img's own stored CSS path (built
+       relative to document.body) is the short, unscoped-collidable
+       "div:nth-of-type(1) > img:nth-of-type(1)" once it's a direct child of
+       body — an unscoped body.querySelector of that path would match
+       #decoy-img's div/img pair first, since it satisfies the same relative
+       pattern and comes first in the document. -->
+  <aside><div><img id="decoy-img" alt="decoy" width="30" height="30" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='30' height='30'%3E%3Crect width='30' height='30' fill='%23f00'/%3E%3C/svg%3E"></div></aside>
+
+  <h2 id="h2-notes">Notes</h2>
+  <p id="before-gap">Text before a big gap.</p>
+  <div id="whitespace-gap" style="height:220px;"></div>
+  <p id="after-gap">Text after a big gap.</p>
+</main>
+<div><img id="colliding-img" alt="second real image" width="30" height="30" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='30' height='30'%3E%3Crect width='30' height='30' fill='%2300f'/%3E%3C/svg%3E"></div>
+<script src="/comment-mode.js"></script>
+<script>
+  window.commentModeInstance = window.CommentMode.init();
+</script>
+</body>
+</html>
