@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Comment mode fixture — no page reference supplied</title>
+</head>
+<body>
+  <main>
+    <p id="intro">This page supplies no page reference at all, in head or in setup code.</p>
+  </main>
+  <script src="/comment-mode.js"></script>
+  <script>
+    window.commentModeInitError = null;
+    try {
+      window.commentModeInstance = window.CommentMode.init();
+    } catch (e) {
+      window.commentModeInitError = e.message;
+    }
+  </script>
+</body>
+</html>

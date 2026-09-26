@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="comment-mode:page-id" content="fixture-page">
+<title>Comment mode fixture</title>
+<style>
+  /* Deliberately loud, high-specificity host styles, so tests can assert
+     comment mode's shadow-rendered UI is unaffected by them, and that
+     comment mode's own shadow-scoped styles never leak onto host elements
+     that happen to share its class names. `!important` on rules that target
+     the shadow host element (matched here by the universal selector and by
+     `div`) is the case that actually defeats a plain `:host { all: initial }`
+     (importance beats specificity), which is what comment-mode.js guards
+     against with `:host { all: initial !important }`. */
+  * { letter-spacing: 4px !important; text-transform: uppercase !important; }
+  div { position: absolute !important; display: block !important; }
+  body { font-family: "Comic Sans MS", cursive; color: red; background: yellow; }
+  button { font-family: "Comic Sans MS", cursive; color: red; border: 5px dashed lime; }
+  a { color: lime; }
+  /* Host's own elements, deliberately reusing comment mode's class names, to
+     prove the module's shadow styles don't leak onto them. */
+  .cm-toggle { background: purple !important; border-radius: 0 !important; }
+  .cm-quote { color: orange !important; font-size: 40px !important; }
+</style>
+</head>
+<body>
+  <main>
+    <h1>Weekly Digest Email</h1>
+    <p id="intro">This is the first sentence of the introduction. This is the second sentence of the introduction. Here is a third one for good measure.</p>
+    <p id="detail">Support has logged sixty one tickets this quarter. Most of them ask for a weekly summary. A few ask for something else entirely.</p>
+    <p id="tail">First sentence here. Last one ends right at the boundary</p>
+    <a href="/test/fixtures/link-target.html" id="a-link">A link that must not navigate while comment mode is active</a>
+    <button class="cm-toggle" id="host-toggle">Host's own toggle</button>
+    <p class="cm-quote" id="host-quote">Host's own quote-like paragraph</p>
+  </main>
+  <script src="/comment-mode.js"></script>
+  <script>
+    window.commentModeInstance = window.CommentMode.init();
+  </script>
+</body>
+</html>
