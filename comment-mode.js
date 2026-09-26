@@ -1685,13 +1685,21 @@
           // button label and pin layer in place rather than rebuilding the
           // sheet (as delete's closeSheet()+renderPins() can afford to),
           // because rebuilding would throw away any text, sentiment or reply
-          // draft the sheet is still holding unsaved.
-          comment.resolved = !comment.resolved;
-          comment.updatedAt = new Date().toISOString();
+          // draft the sheet is still holding unsaved. Toggle the *current*
+          // record (see findCurrentComment), not the one captured when the
+          // sheet opened, which a sync reconcile may have since detached
+          // from `comments`.
+          var live = findCurrentComment(comment.id) || comment;
+          live.resolved = !live.resolved;
+          live.updatedAt = new Date().toISOString();
           saveComments(storageKey, comments);
+          // Browser-first, then sync: resolve/reopen is a mutation like any
+          // other and must reach the plug-in the same way create/edit/delete
+          // do.
+          syncEngine.save(comments);
           renderPins();
-          resolveBtn.textContent = comment.resolved ? 'Reopen' : 'Resolve';
-          resolvedBadge.style.display = comment.resolved ? '' : 'none';
+          resolveBtn.textContent = live.resolved ? 'Reopen' : 'Resolve';
+          resolvedBadge.style.display = live.resolved ? '' : 'none';
         });
         actions.appendChild(resolveBtn);
 
@@ -1828,9 +1836,16 @@
           // handler below): the reply keeps whatever the session's author
           // was at the moment it was written.
           if (author) reply.author = JSON.parse(JSON.stringify(author));
-          comment.replies = (comment.replies || []).concat([reply]);
-          comment.updatedAt = new Date().toISOString();
+          // Append to the *current* record (see findCurrentComment), not
+          // the one captured when the sheet opened, which a sync reconcile
+          // may have since detached from `comments`.
+          var live = findCurrentComment(comment.id) || comment;
+          live.replies = (live.replies || []).concat([reply]);
+          live.updatedAt = new Date().toISOString();
           saveComments(storageKey, comments);
+          // Browser-first, then sync: a reply is a mutation like any other
+          // and must reach the plug-in the same way create/edit/delete do.
+          syncEngine.save(comments);
           // Appended in place, same reasoning as resolve/reopen above: a
           // full sheet rebuild would drop whatever the main textarea,
           // sentiment or this reply box itself still holds unsaved.

@@ -1395,12 +1395,13 @@ test.describe('storage plug-in subscribe wiring', () => {
   });
 });
 
-test.describe('delete syncs to the storage plug-in', () => {
+test.describe('mutations sync to the storage plug-in', () => {
   // Regression test (FOR-444 review item 2): the delete handler used to
   // mark the record and write to localStorage but never call into the sync
   // engine, so a delete never reached the plug-in until some unrelated sync
   // happened to run. Delete must go through the same browser-first-then-sync
-  // path create/edit do.
+  // path create/edit do. Resolve/reopen and reply (FOR-442, added after this
+  // ticket's sync engine existed) had the identical gap, fixed the same way.
   test('deleting a comment reaches the plug-in save with deleted: true', async ({ page }) => {
     await page.goto('/test/fixtures/page-recording-plugin.html');
     await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
@@ -1416,6 +1417,45 @@ test.describe('delete syncs to the storage plug-in', () => {
     const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
     expect(lastSave).toHaveLength(1);
     expect(lastSave[0].deleted).toBe(true);
+  });
+
+  // Resolve/reopen and reply have the same shape of bug: FOR-442 added them
+  // after this ticket's sync engine existed, mutating the comment and
+  // writing to localStorage without ever calling into it.
+  test('resolving a comment reaches the plug-in save with resolved: true', async ({ page }) => {
+    await page.goto('/test/fixtures/page-recording-plugin.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('Resolve me via plug-in.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByRole('button', { name: 'Resolve', exact: true }).tap();
+
+    const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
+    expect(lastSave).toHaveLength(1);
+    expect(lastSave[0].resolved).toBe(true);
+  });
+
+  test('a reply reaches the plug-in save on the parent comment', async ({ page }) => {
+    await page.goto('/test/fixtures/page-recording-plugin.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('Reply to me via plug-in.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByPlaceholder('Reply…').fill('A reply that must sync.');
+    await page.getByRole('button', { name: 'Reply', exact: true }).tap();
+
+    const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
+    expect(lastSave).toHaveLength(1);
+    expect(lastSave[0].replies).toHaveLength(1);
+    expect(lastSave[0].replies[0].text).toBe('A reply that must sync.');
   });
 });
 
@@ -1439,7 +1479,7 @@ test.describe('editing during a concurrent subscribe push', () => {
 
     await page.getByRole('button', { name: 'Exit comment mode', exact: true }).tap();
     await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
-    await expect(page.locator('textarea')).toHaveValue('Original text.');
+    await expect(page.getByPlaceholder('Leave a comment…')).toHaveValue('Original text.');
 
     // While the edit sheet is open, a subscribe push arrives reporting the
     // plug-in's current full state: a fresh (differently-identified) copy
@@ -1464,7 +1504,7 @@ test.describe('editing during a concurrent subscribe push', () => {
       window.subscribeOnChange(pushed);
     });
 
-    await page.locator('textarea').fill('Edited during a concurrent push.');
+    await page.getByPlaceholder('Leave a comment…').fill('Edited during a concurrent push.');
     await page.getByRole('button', { name: 'Save' }).tap();
     await expect(page.locator('textarea')).toHaveCount(0);
 
