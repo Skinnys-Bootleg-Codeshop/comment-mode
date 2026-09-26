@@ -16,7 +16,7 @@ export default function Home() {
         your own browser, comments made here persist on the server and are visible to every
         visitor.
       </p>
-      <CommentModeLoader />
+      <CommentModeLoader pageReference={{ id: 'nextjs-upstash-example' }} />
     </main>
   );
 }

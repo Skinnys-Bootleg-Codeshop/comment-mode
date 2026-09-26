@@ -197,10 +197,10 @@ comment-mode.js itself actually produces is:
   optional.
 - `meta`: present only when the host supplied one at `init` time; whatever
   shape the host gave it, stamped on the same way as `author`.
-- `updatedAt`: added the moment a comment is first edited, re-anchored or
-  replied to; absent on a comment nothing has touched since creation (see
-  "Conflicts" above for how a merge falls back to `createdAt` when it's
-  missing).
+- `updatedAt`: added the moment a comment is first edited, re-anchored,
+  replied to, resolved, reopened or deleted; absent on a comment nothing has
+  touched since creation (see "Conflicts" above for how a merge falls back
+  to `createdAt` when it's missing).
 - `resolved`: added, set to `true`, the moment a comment is first resolved;
   reopening it sets it back to `false` rather than removing it. A comment
   that has never been resolved has no `resolved` field at all, not
@@ -215,7 +215,7 @@ comment-mode.js itself actually produces is:
   `author`.
 
 `pageReference` is not stored on the comment object itself: comment-mode.js
-already scopes storage by page reference (see "Storage plug-ins" below), so
+already scopes storage by page reference (see "Storage plug-ins" above), so
 nothing in it reads a `pageReference` back off a comment. A plug-in or
 server is free to add one to its own stored copy, and `test/contract-suite.js`'s
 own fixture comments do, but it plays no part in the contract itself.
@@ -235,21 +235,30 @@ fields present only for certain anchors:
 - `scope` is one of `word`, `sentence`, `block` or `section` (CONTEXT.md's
   "Scope" entry).
 - `rel` is `{ x, y }`, each `0`-`1`: the tap's fractional position within its
-  resolved element's own bounding rect, so a pin can sit precisely where the
-  reader tapped rather than just at the anchor's start.
-- `near: true` marks a whitespace or gap anchor with no exact text of its
-  own (a tap between two elements, or on empty space).
+  resolved element's own bounding rect. It is only used for an anchor
+  located via `path` (a text-quote anchor is already positioned precisely by
+  its own re-found Range, which needs no help from `rel`), so a pin for a
+  structural anchor can still sit close to where the block was originally
+  tapped even though the element carries no text a Range could be built
+  from.
+- `near: true` marks a whitespace or gap anchor located near, rather than
+  on, real content (a tap between two elements, or on empty space). It still
+  carries the matched block's own text (or a generated description, such as
+  `[image: ...]`, when the block has none) as `quote.exact`; `near` only
+  means the tap didn't land on that text directly.
 - `path`: a CSS selector from `document.body`, present only as a structural
-  fallback for a block or section anchor whose content isn't literally
-  searchable text on the page, such as an image; comment-mode.js falls back
-  to this instead of an unsearchable quote in that case.
+  fallback for a block anchor whose content isn't literally searchable text
+  on the page, such as an image; comment-mode.js falls back to this instead
+  of an unsearchable quote in that case.
 
-**What the server behind this endpoint must do.** A POST's `comments` array
-is comment mode's current local knowledge, not a full replacement of what
-the server holds: the server must upsert by `id` into its own store, never
-delete or drop an id merely because a POST's array doesn't mention it (only
-an explicit `deleted: true` record removes a comment from view), and resolve
-each `id` by the same rule as comment mode itself: newest `updatedAt` wins
+### What the server behind this endpoint must do
+
+A POST's `comments` array is comment mode's current local knowledge, not a
+full replacement of what the server holds: the server must upsert by `id`
+into its own store, never delete or drop an id merely because a POST's
+array doesn't mention it (only an explicit `deleted: true` record removes a
+comment from view), and resolve each `id` by the same rule as comment mode
+itself: newest `updatedAt` wins
 (falling back to `createdAt`), timestamps parsed as UTC ISO-8601, incoming
 wins an exact tie. Timestamp comparison alone is not enough for `deleted`,
 though: it is sticky, not just newest-wins. If either the record already
@@ -282,8 +291,8 @@ meant to be copied, not installed. Pick whichever matches your situation.
   its own. One HTML file, opened straight from disk (`file://`, no server,
   no build step). It uses the default `browserOnly()` plug-in, so comments
   stay in that one browser's `localStorage` and never leave it. Copy
-  `comment-mode.js` next to your own HTML file, add the same meta tag and
-  the same two script tags this example uses, and you're done.
+  `comment-mode.js` next to your own HTML file, add the same one-line script
+  tag this example uses, and you're done.
 - **`examples/nextjs-upstash/`**: a hosted app where comments should be
   visible to everyone who loads the page, not just the browser that wrote
   them. A small Next.js app with one component that mounts comment mode
