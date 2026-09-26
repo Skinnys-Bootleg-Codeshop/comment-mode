@@ -12,13 +12,15 @@
  * Scope resolution supports word, sentence, block and section scopes (Linear
  * FOR-440), stepped through with the sheet's −/+ controls; anchors are
  * text-quote anchors (exact quote plus short prefix/suffix context, or a
- * structural CSS path for image-like blocks with no text of their own), and
- * storage is browser-only. FOR-441 added a sentiment picker, host-supplied
+ * structural CSS path for image-like blocks with no text of their own).
+ * FOR-441 added a sentiment picker, host-supplied
  * author/meta stamped onto new comments, and in-place editing and soft
  * delete from a comment's pin. FOR-442 added replies, resolve/reopen, and a
- * show-resolved switch. See CONTEXT.md and the ticket for what is
- * deliberately not here yet (scope resize, a storage plug-in, and any
- * auth/permissions system beyond the `author` field itself).
+ * show-resolved switch. FOR-444 added storage plug-ins, offline-first sync
+ * and a reusable storage contract suite (see README "Storage plug-ins" and
+ * test/contract-suite.js), so a host is no longer limited to one browser's
+ * localStorage. See CONTEXT.md and the ticket for what is deliberately not
+ * here yet (any auth/permissions system beyond the `author` field itself).
  */
 (function (global) {
   'use strict';
@@ -151,14 +153,17 @@
     }
 
     function loadUrl(pageReference) {
-      // Building the query string with the URL API (rather than string
-      // concatenation) is what keeps this correct when `endpoint` already
-      // has its own query string (e.g. an API key): `?pageReference=...`
-      // pasted onto an endpoint that already ends in `?key=abc` produces
-      // `...?key=abc?pageReference=...`, which most servers parse wrong.
-      var url = new URL(endpoint);
-      url.searchParams.set('pageReference', JSON.stringify(pageReference));
-      return url.toString();
+      // Deliberately not the URL API here: `new URL(endpoint)` throws
+      // synchronously on a relative endpoint (e.g. `/api/comments`, which
+      // many real hosts pass, since the comments endpoint usually lives on
+      // the same origin as the page). That throw would happen before
+      // load() even returns a promise, breaking its contract and wedging
+      // needsSync retries forever with no visible error. Appending the
+      // query string by hand, but correctly (`&` when `endpoint` already
+      // has a `?`, `?` when it doesn't), handles both absolute and relative
+      // endpoints with no base-URL fallback to get wrong.
+      var separator = endpoint.indexOf('?') === -1 ? '?' : '&';
+      return endpoint + separator + 'pageReference=' + encodeURIComponent(JSON.stringify(pageReference));
     }
 
     function load(pageReference) {

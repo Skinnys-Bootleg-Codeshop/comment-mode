@@ -20,12 +20,11 @@ runStorageContractSuite('web-address plug-in', async function () {
 });
 
 test.describe('web-address plug-in with a query string already on the endpoint', function () {
-  // Regression test: appending `?pageReference=...` by string concatenation
-  // onto an endpoint that already has its own query string (e.g. an API
-  // key) used to produce `...?key=abc?pageReference=...`, a single
-  // malformed query string most servers (including the fake one here) parse
-  // wrong. Building the URL with the URL API instead must keep both params
-  // intact.
+  // Regression test: naively appending `?pageReference=...` onto an
+  // endpoint that already has its own query string (e.g. an API key) used
+  // to produce `...?key=abc?pageReference=...`, a single malformed query
+  // string most servers (including the fake one here) parse wrong.
+  // load()/save() must append with `&` when `endpoint` already has a `?`.
   test.it('load and save both work when endpoint already has a query string', async function () {
     var server = createWebAddressServer();
     var endpoint = await server.listen();
@@ -45,6 +44,33 @@ test.describe('web-address plug-in with a query string already on the endpoint',
 
     assert.equal(loaded.length, 1);
     assert.equal(loaded[0].text, 'still works with an existing query string');
+  });
+});
+
+test.describe('web-address plug-in with a relative endpoint', function () {
+  // Regression test: `new URL(endpoint)` throws synchronously on a relative
+  // path like `/api/comments` (no base to resolve against), which many real
+  // hosts pass since the comments endpoint usually lives on the same origin
+  // as the page. That throw happened before load() even returned a
+  // promise, breaking its contract and wedging needsSync retries forever
+  // with no visible error. No real server is needed here: a stub fetch is
+  // enough to prove load() resolves and is called with the right URL.
+  test.it('load resolves and calls fetch with the relative URL, not throwing', async function () {
+    var calls = [];
+    var stubFetch = function (url) {
+      calls.push(url);
+      return Promise.resolve({
+        ok: true,
+        json: function () { return Promise.resolve({ comments: [] }); }
+      });
+    };
+    var plugin = CommentMode.plugins.webAddress({ endpoint: '/api/comments', fetch: stubFetch });
+
+    var loaded = await plugin.load({ id: 'p' });
+
+    assert.deepEqual(loaded, []);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0], '/api/comments?pageReference=' + encodeURIComponent(JSON.stringify({ id: 'p' })));
   });
 });
 
