@@ -535,9 +535,9 @@ test.describe('editing a comment', () => {
     await page.getByRole('button', { name: 'Exit comment mode', exact: true }).tap();
 
     await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
-    await expect(page.locator('textarea')).toHaveValue('Original text.');
+    await expect(page.getByPlaceholder('Leave a comment…')).toHaveValue('Original text.');
 
-    await page.locator('textarea').fill('Revised text.');
+    await page.getByPlaceholder('Leave a comment…').fill('Revised text.');
     await page.getByRole('button', { name: 'Positive', exact: true }).tap();
     await page.getByRole('button', { name: 'Save' }).tap();
 
@@ -565,7 +565,7 @@ test.describe('editing a comment', () => {
     await page.getByRole('button', { name: 'Save' }).tap();
 
     await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
-    await page.locator('textarea').fill('After edit.');
+    await page.getByPlaceholder('Leave a comment…').fill('After edit.');
     await page.getByRole('button', { name: 'Save' }).tap();
 
     await page.reload();
@@ -594,7 +594,7 @@ test.describe('editing a comment', () => {
 
     // Reopen and save again without touching text or sentiment.
     await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
-    await expect(page.locator('textarea')).toHaveValue('Unchanged text.');
+    await expect(page.getByPlaceholder('Leave a comment…')).toHaveValue('Unchanged text.');
     await page.getByRole('button', { name: 'Save' }).tap();
     await expect(page.locator('textarea')).toHaveCount(0);
 
@@ -604,6 +604,233 @@ test.describe('editing a comment', () => {
     expect(stored).toHaveLength(1);
     expect(stored[0].text).toBe('Unchanged text.');
     expect(stored[0].updatedAt).toBeUndefined();
+  });
+});
+
+test.describe('replies', () => {
+  test('a reply is shown under its comment, with author and time, and stored with the parent comment', async ({ page }) => {
+    await page.goto('/test/fixtures/page-author-meta.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').first().fill('Needs a source.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByPlaceholder('Reply…').fill('Added one below.');
+    await page.getByRole('button', { name: 'Reply', exact: true }).tap();
+
+    const reply = page.locator('[data-comment-mode-host]').locator('.cm-reply');
+    await expect(reply).toHaveCount(1);
+    await expect(reply.locator('.cm-reply-text')).toHaveText('Added one below.');
+    const metaText = await reply.locator('.cm-reply-meta').textContent();
+    expect(metaText).toContain('Ada Lovelace');
+    // "with author and times" (FOR-442's acceptance criteria): the meta line
+    // must carry a time, not just the author name.
+    expect(metaText).not.toBe('Ada Lovelace');
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:author-meta-fixture'))
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].replies).toHaveLength(1);
+    expect(stored[0].replies[0].text).toBe('Added one below.');
+    expect(stored[0].replies[0].author).toEqual({ name: 'Ada Lovelace', id: 'user-42' });
+    expect(stored[0].replies[0].createdAt).toBeTruthy();
+    // A reply is stored with its parent comment, and the parent's own
+    // updatedAt reflects that it changed.
+    expect(stored[0].updatedAt).toBeTruthy();
+  });
+
+  test('a reply does not lose an unsaved edit to the comment above it', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').first().fill('Saved text.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByPlaceholder('Leave a comment…').fill('Edited but not saved.');
+    await page.getByPlaceholder('Reply…').fill('A reply.');
+    await page.getByRole('button', { name: 'Reply', exact: true }).tap();
+
+    await expect(page.getByPlaceholder('Leave a comment…')).toHaveValue('Edited but not saved.');
+  });
+
+  test('replies are shown under their comment in order', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').first().fill('First.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByPlaceholder('Reply…').fill('Reply one.');
+    await page.getByRole('button', { name: 'Reply', exact: true }).tap();
+    await page.getByPlaceholder('Reply…').fill('Reply two.');
+    await page.getByRole('button', { name: 'Reply', exact: true }).tap();
+
+    const replies = page.locator('[data-comment-mode-host]').locator('.cm-reply-text');
+    await expect(replies).toHaveCount(2);
+    await expect(replies.nth(0)).toHaveText('Reply one.');
+    await expect(replies.nth(1)).toHaveText('Reply two.');
+  });
+
+  test('replies are still there, in order, after a reload', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').first().fill('Original.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByPlaceholder('Reply…').fill('First reply.');
+    await page.getByRole('button', { name: 'Reply', exact: true }).tap();
+    await page.getByPlaceholder('Reply…').fill('Second reply.');
+    await page.getByRole('button', { name: 'Reply', exact: true }).tap();
+
+    await page.reload();
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+
+    const replies = page.locator('[data-comment-mode-host]').locator('.cm-reply-text');
+    await expect(replies).toHaveCount(2);
+    await expect(replies.nth(0)).toHaveText('First reply.');
+    await expect(replies.nth(1)).toHaveText('Second reply.');
+  });
+});
+
+test.describe('resolve and reopen', () => {
+  test('resolving a comment marks it resolved and hides its pin; reopening brings it back', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').first().fill('Fix this.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByRole('button', { name: 'Resolve', exact: true }).tap();
+
+    let stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored[0].resolved).toBe(true);
+    // Resolving updates the badge and button label in place and leaves the
+    // sheet open (see comment-mode.js); close it before reaching for the
+    // switch, which the open sheet otherwise sits on top of.
+    await page.getByRole('button', { name: 'Cancel' }).tap();
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(0);
+
+    await page.getByRole('checkbox', { name: 'Show resolved' }).check();
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(1);
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-resolved-badge')).toHaveCount(0);
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-resolved-badge')).toHaveText('Resolved');
+    await page.getByRole('button', { name: 'Reopen', exact: true }).tap();
+
+    stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored[0].resolved).toBe(false);
+    await page.getByRole('button', { name: 'Cancel' }).tap();
+    await page.getByRole('checkbox', { name: 'Show resolved' }).uncheck();
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(1);
+  });
+
+  test('resolving does not lose an unsaved edit to the comment', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').first().fill('Original.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByPlaceholder('Leave a comment…').fill('Edited but not saved.');
+    await page.getByRole('button', { name: 'Resolve', exact: true }).tap();
+
+    await expect(page.getByPlaceholder('Leave a comment…')).toHaveValue('Edited but not saved.');
+
+    // Reopening (a second toggle) must not lose it either.
+    await page.getByRole('button', { name: 'Reopen', exact: true }).tap();
+    await expect(page.getByPlaceholder('Leave a comment…')).toHaveValue('Edited but not saved.');
+  });
+
+  test('a reopened comment is still open (its pin visible without the switch) after a reload', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').first().fill('Resolve then reopen.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByRole('button', { name: 'Resolve', exact: true }).tap();
+    await page.getByRole('button', { name: 'Reopen', exact: true }).tap();
+    await page.getByRole('button', { name: 'Cancel' }).tap();
+
+    await page.reload();
+
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(1);
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored[0].resolved).toBe(false);
+  });
+
+  test('the show-resolved switch resets to hidden on every reload, even if it was left on', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').first().fill('Resolve me too.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByRole('button', { name: 'Resolve', exact: true }).tap();
+    await page.getByRole('button', { name: 'Cancel' }).tap();
+
+    await page.getByRole('checkbox', { name: 'Show resolved' }).check();
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(1);
+
+    await page.reload();
+
+    await expect(page.getByRole('checkbox', { name: 'Show resolved' })).not.toBeChecked();
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(0);
+  });
+
+  test('a resolved comment stays resolved and hidden by default after a reload', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').first().fill('Resolve me.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByRole('button', { name: 'Resolve', exact: true }).tap();
+    await page.getByRole('button', { name: 'Cancel' }).tap();
+
+    await page.reload();
+
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(0);
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored[0].resolved).toBe(true);
+
+    await page.getByRole('checkbox', { name: 'Show resolved' }).check();
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(1);
   });
 });
 
