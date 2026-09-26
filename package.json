@@ -1,0 +1,13 @@
+{
+  "name": "comment-mode",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Dev tooling for comment-mode's Playwright test suite. comment-mode.js itself has no runtime dependencies; see docs/adr/0003-copy-first-not-a-package.md.",
+  "scripts": {
+    "test": "playwright test",
+    "serve": "node test/serve.js"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0"
+  }
+}
