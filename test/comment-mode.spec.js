@@ -754,6 +754,10 @@ test.describe('scopes', () => {
     await page.locator('textarea').fill('Nice mockup.');
     await page.getByRole('button', { name: 'Save' }).tap();
 
+    // An image carries no text a Range could be built from, so its pin is
+    // positioned by the anchor's stored `rel` (FOR-443): the fraction across
+    // the image's own rect where the tap landed, here its centre, not the
+    // image's top-left corner.
     async function pinOverImage() {
       return page.evaluate(() => {
         const host = document.querySelector('[data-comment-mode-host]');
@@ -762,7 +766,10 @@ test.describe('scopes', () => {
         const imgRect = img.getBoundingClientRect();
         return {
           pin: pin ? { left: parseFloat(pin.style.left), top: parseFloat(pin.style.top) } : null,
-          image: { left: imgRect.left + window.scrollX, top: imgRect.top + window.scrollY }
+          image: {
+            left: imgRect.left + imgRect.width / 2 + window.scrollX,
+            top: imgRect.top + imgRect.height / 2 + window.scrollY
+          }
         };
       });
     }
@@ -807,7 +814,13 @@ test.describe('scopes', () => {
       const decoy = document.getElementById('decoy-img').getBoundingClientRect();
       return {
         pin: pin ? { left: parseFloat(pin.style.left), top: parseFloat(pin.style.top) } : null,
-        target: { left: target.left + window.scrollX, top: target.top + window.scrollY },
+        // The tap landed on the image's centre; see the sibling image test
+        // above for why the pin is positioned there rather than the image's
+        // top-left corner.
+        target: {
+          left: target.left + target.width / 2 + window.scrollX,
+          top: target.top + target.height / 2 + window.scrollY
+        },
         decoy: { left: decoy.left + window.scrollX, top: decoy.top + window.scrollY }
       };
     });
@@ -1281,5 +1294,219 @@ test.describe('deleting a comment', () => {
     expect(stored).toHaveLength(1);
     expect(stored[0].deleted).toBe(true);
     expect(stored[0].text).toBe('Delete me.');
+  });
+});
+
+test.describe('re-anchoring, orphans and re-pin', () => {
+  // Extracts the same {pin, anchor} rect pair persistence-across-reload's
+  // pinAndAnchorRects uses, but against #detail's live text rather than a
+  // reload, since these tests re-anchor without ever navigating away.
+  async function pinAndDetailRect(page) {
+    return page.evaluate(() => {
+      const host = document.querySelector('[data-comment-mode-host]');
+      const pin = host.shadowRoot.querySelector('.cm-pin');
+      const stored = JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'));
+      const quote = stored[0].anchor.quote.exact;
+      const p = document.getElementById('detail');
+      const idx = p.textContent.indexOf(quote);
+      const textNode = Array.from(p.childNodes).find((n) => n.nodeType === 3 && n.nodeValue.includes(quote));
+      const range = document.createRange();
+      range.setStart(textNode, textNode.nodeValue.indexOf(quote));
+      range.setEnd(textNode, textNode.nodeValue.indexOf(quote) + quote.length);
+      const rect = range.getBoundingClientRect();
+      return {
+        pin: pin ? { left: parseFloat(pin.style.left), top: parseFloat(pin.style.top) } : null,
+        anchor: { left: rect.left + window.scrollX, top: rect.top + window.scrollY }
+      };
+    });
+  }
+
+  test('a pin stays correctly positioned on its text after the viewport resizes', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#detail').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width * 0.2, box.y + box.height / 2);
+    await page.locator('textarea').fill('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.setViewportSize({ width: 420, height: 860 });
+    // Re-anchoring on resize is debounced (120ms); give it room to fire.
+    await page.waitForTimeout(300);
+
+    const after = await pinAndDetailRect(page);
+    expect(after.pin).not.toBeNull();
+    expect(Math.abs(after.pin.left - after.anchor.left)).toBeLessThanOrEqual(5);
+    expect(Math.abs(after.pin.top - after.anchor.top)).toBeLessThanOrEqual(5);
+  });
+
+  test('a host re-render that keeps the anchored text intact keeps the pin, not orphaned', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#detail').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width * 0.2, box.y + box.height / 2);
+    await page.locator('textarea').fill('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    // Simulates a host re-rendering the same content into new elements (a
+    // React re-render, say): the quote text survives, only the nodes it
+    // lives in are replaced.
+    await page.evaluate(() => {
+      const p = document.getElementById('detail');
+      p.innerHTML = '<span>' + p.textContent + '</span>';
+    });
+    await page.waitForTimeout(300);
+
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(1);
+    await expect(page.getByRole('button', { name: /Orphaned/ })).toHaveCount(0);
+  });
+
+  test('rewriting a comment\'s anchored text orphans it and lists it in the orphan panel with its original quote', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#detail').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width * 0.2, box.y + box.height / 2);
+    await page.locator('textarea').fill('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    const quote = await page.evaluate(
+      () => JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))[0].anchor.quote.exact
+    );
+
+    // Rewrites the fixture text so the stored quote can no longer be found
+    // anywhere on the page, orphaning the comment (FOR-443's acceptance
+    // criterion: "Browser tests rewrite fixture text to create an orphan").
+    await page.evaluate(() => {
+      document.getElementById('detail').textContent = 'This paragraph now says something else entirely.';
+    });
+    await page.waitForTimeout(300);
+
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(0);
+    const orphanToggle = page.getByRole('button', { name: 'Orphaned (1)' });
+    await expect(orphanToggle).toBeVisible();
+    await orphanToggle.tap();
+
+    const panelQuote = await page
+      .locator('[data-comment-mode-host]')
+      .locator('.cm-orphan-quote')
+      .textContent();
+    expect(panelQuote).toContain(quote);
+  });
+
+  test('re-pinning an orphaned comment replaces its anchor and clears the orphan', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const detailBox = await page.locator('#detail').boundingBox();
+    if (!detailBox) throw new Error('missing bounding box');
+    await page.touchscreen.tap(detailBox.x + detailBox.width * 0.2, detailBox.y + detailBox.height / 2);
+    await page.locator('textarea').fill('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.evaluate(() => {
+      document.getElementById('detail').textContent = 'This paragraph now says something else entirely.';
+    });
+    await page.waitForTimeout(300);
+
+    await page.getByRole('button', { name: 'Orphaned (1)' }).tap();
+    await page.getByRole('button', { name: 'Re-pin' }).tap();
+
+    // Re-pinning re-enters placement mode: the next tap resolves a fresh
+    // anchor for the same comment, on #intro this time.
+    const introBox = await page.locator('#intro').boundingBox();
+    if (!introBox) throw new Error('missing bounding box');
+    await page.touchscreen.tap(introBox.x + 4, introBox.y + 4);
+
+    await expect(page.getByPlaceholder('Leave a comment…')).toHaveValue('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(1);
+    await expect(page.getByRole('button', { name: /Orphaned/ })).toHaveCount(0);
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].anchor.quote.exact).toContain('first sentence');
+    expect(stored[0].text).toBe('Where did this number come from?');
+  });
+
+  test('resolving an orphaned comment from the panel hides it there too', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#detail').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width * 0.2, box.y + box.height / 2);
+    await page.locator('textarea').fill('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.evaluate(() => {
+      document.getElementById('detail').textContent = 'This paragraph now says something else entirely.';
+    });
+    await page.waitForTimeout(300);
+
+    await page.getByRole('button', { name: 'Orphaned (1)' }).tap();
+    await page.getByRole('button', { name: 'Resolve' }).tap();
+
+    await expect(page.getByRole('button', { name: /Orphaned/ })).toHaveCount(0);
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored[0].resolved).toBe(true);
+  });
+
+  test('deleting an orphaned comment from the panel removes it from the panel', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#detail').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width * 0.2, box.y + box.height / 2);
+    await page.locator('textarea').fill('Where did this number come from?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.evaluate(() => {
+      document.getElementById('detail').textContent = 'This paragraph now says something else entirely.';
+    });
+    await page.waitForTimeout(300);
+
+    await page.getByRole('button', { name: 'Orphaned (1)' }).tap();
+    await page.getByRole('button', { name: 'Delete' }).tap();
+
+    await expect(page.getByRole('button', { name: /Orphaned/ })).toHaveCount(0);
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored[0].deleted).toBe(true);
+  });
+
+  test('reopening a pin highlights its original sentence, not the whole paragraph', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    // Tap inside the second sentence of #intro, same as the sentence-scope
+    // test above, so the anchored quote is narrower than the paragraph.
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width * 0.55, box.y + box.height / 2);
+    await page.locator('textarea').fill('Source?');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+
+    const rects = await page.evaluate(() => {
+      const host = document.querySelector('[data-comment-mode-host]');
+      const highlights = Array.from(host.shadowRoot.querySelectorAll('.cm-highlight-box'));
+      const introWidth = document.getElementById('intro').getBoundingClientRect().width;
+      return {
+        count: highlights.length,
+        maxWidth: Math.max(...highlights.map((h) => parseFloat(h.style.width))),
+        introWidth: introWidth
+      };
+    });
+    expect(rects.count).toBeGreaterThan(0);
+    // A highlight box narrower than the whole paragraph proves it outlines
+    // the sentence actually anchored, not just the block it lives in (the
+    // a6 prototype's known gap this ticket fixes).
+    expect(rects.maxWidth).toBeLessThan(rects.introWidth);
   });
 });

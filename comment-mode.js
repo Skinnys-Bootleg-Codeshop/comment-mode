@@ -16,9 +16,14 @@
  * storage is browser-only. FOR-441 added a sentiment picker, host-supplied
  * author/meta stamped onto new comments, and in-place editing and soft
  * delete from a comment's pin. FOR-442 added replies, resolve/reopen, and a
- * show-resolved switch. See CONTEXT.md and the ticket for what is
- * deliberately not here yet (scope resize, a storage plug-in, and any
- * auth/permissions system beyond the `author` field itself).
+ * show-resolved switch. FOR-443 added re-anchoring on resize, rotation and a
+ * host DOM re-render; a `rel` position within a structural (cssPath) anchor's
+ * block, used only when its quote can't be found on the page at all; an
+ * orphan panel for comments whose anchor can't be found; re-pin from that
+ * panel; and a highlight of a reopened comment's actual matched range. See
+ * CONTEXT.md and the ticket for what is deliberately not here yet (scope
+ * resize, a storage plug-in, and any auth/permissions system beyond the
+ * `author` field itself).
  */
 (function (global) {
   'use strict';
@@ -656,7 +661,28 @@
       onText: onText,
       near: near,
       levels: levels,
-      levelIndex: levels.indexOf(defaultScope)
+      levelIndex: levels.indexOf(defaultScope),
+      // Kept alongside the resolved block so computeAnchorForScope can derive
+      // `rel` (see relativePositionInBlock) — the same tap point regardless
+      // of which scope the −/+ controls later step to.
+      clientX: clientX,
+      clientY: clientY
+    };
+  }
+
+  // Where a tap fell within a block's own rect, as fractions clamped to
+  // [0, 1]. Stored on an anchor as `rel` instead of any absolute pixels, so
+  // it stays meaningful after the page reflows: only the structural
+  // (cssPath) re-anchoring path uses it (see resolveAnchorPosition below),
+  // since a text-quote anchor is already positioned precisely by its own
+  // re-found Range.
+  function relativePositionInBlock(clientX, clientY, rect) {
+    if (!rect || rect.width === 0 || rect.height === 0) return { x: 0, y: 0 };
+    var x = (clientX - rect.left) / rect.width;
+    var y = (clientY - rect.top) / rect.height;
+    return {
+      x: x < 0 ? 0 : x > 1 ? 1 : x,
+      y: y < 0 ? 0 : y > 1 ? 1 : y
     };
   }
 
@@ -727,6 +753,7 @@
   // normally happen for a scope resolveTap actually offered).
   function computeAnchorForScope(context, scope) {
     var pageIndex = buildTextIndex(document.body);
+    var rel = relativePositionInBlock(context.clientX, context.clientY, context.block.getBoundingClientRect());
 
     if (scope === 'word' || scope === 'sentence') {
       var blockIndex = buildTextIndex(context.block);
@@ -746,6 +773,7 @@
       if (!globals) return null;
       var anchor = buildQuoteAnchor(pageIndex.text, globals.start, globals.end, false);
       anchor.scope = scope;
+      anchor.rel = rel;
       return anchor;
     }
 
@@ -774,7 +802,8 @@
         var blockAnchor = {
           quote: { exact: description, prefix: '', suffix: '' },
           scope: 'block',
-          path: cssPathFromBody(context.block)
+          path: cssPathFromBody(context.block),
+          rel: rel
         };
         if (context.near) blockAnchor.near = true;
         return blockAnchor;
@@ -786,6 +815,7 @@
         context.near
       );
       blockAnchor2.scope = 'block';
+      blockAnchor2.rel = rel;
       return blockAnchor2;
     }
 
@@ -804,6 +834,7 @@
       context.near
     );
     sectionAnchor.scope = 'section';
+    sectionAnchor.rel = rel;
     return sectionAnchor;
   }
 
@@ -866,14 +897,13 @@
     return rangeForOffsets(pageIndex.entries, position, position + quote.exact.length);
   }
 
-  // Finds where a stored anchor currently is on the page, as a rect a pin
-  // can be placed at. Quote text is tried first (locateAnchor); an anchor
-  // with no text of its own (an image's `[image: ...]` description can never
-  // match a text search, since it isn't literally on the page) falls back to
-  // its stored CSS path instead, using the element's own rect rather than a
-  // Range — `Range.selectNodeContents` on a childless element like <img>
-  // produces a zero-size range regardless of how large the image actually
-  // renders.
+  // Finds what a stored anchor currently refers to on the page: a Range for
+  // a text-quote anchor, or an Element for a structural (cssPath) anchor.
+  // Quote text is tried first (locateAnchor); an anchor with no text of its
+  // own (an image's `[image: ...]` description can never match a text
+  // search, since it isn't literally on the page) falls back to its stored
+  // CSS path instead. Returns null when neither locates anything, which is
+  // what marks a comment orphaned (see renderPin).
   //
   // `anchor.path` is built (cssPathFromBody) as a chain of `tag:nth-of-type`
   // steps joined by `>`, relative to document.body — but `body.querySelector`
@@ -883,20 +913,47 @@
   // parents) can produce the same `div:nth-of-type(1) > img:nth-of-type(1)`
   // path and collide. `:scope > ` anchors the first step to an actual direct
   // child of body, matching how the path was built.
-  function resolveAnchorRect(anchor, pageIndex) {
+  //
+  // Shared by resolveAnchorPosition (pin placement) and
+  // showHighlightForAnchor (reopened-pin highlight), so the two never
+  // disagree about what "found" means.
+  function locateAnchorTarget(anchor, pageIndex) {
     if (anchor && anchor.quote && typeof anchor.quote.exact === 'string' && anchor.quote.exact) {
       var range = locateAnchor(anchor.quote, pageIndex);
-      if (range) return range.getBoundingClientRect();
+      if (range) return { type: 'range', range: range };
     }
     if (anchor && anchor.path) {
       try {
         var el = document.body.querySelector(':scope > ' + anchor.path);
-        if (el) return el.getBoundingClientRect();
+        if (el) return { type: 'element', el: el };
       } catch (e) {
         // malformed/stale path: fall through to "not found"
       }
     }
     return null;
+  }
+
+  // Finds where a stored anchor currently is on the page, as a point a pin
+  // can be placed at. A text-quote anchor is positioned by its own re-found
+  // Range — `Range.selectNodeContents` on a childless element like <img>
+  // produces a zero-size range regardless of how large the image actually
+  // renders, which is why a structural anchor is positioned differently: at
+  // `anchor.rel`'s fraction across its resolved element's own rect (see
+  // relativePositionInBlock), rather than always the element's top-left
+  // corner, so the pin lands close to where the block was originally tapped
+  // even though the element carries no text a Range could be built from.
+  function resolveAnchorPosition(anchor, pageIndex) {
+    var target = locateAnchorTarget(anchor, pageIndex);
+    if (!target) return null;
+    if (target.type === 'range') {
+      var rect = target.range.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return null;
+      return { left: rect.left, top: rect.top };
+    }
+    var elRect = target.el.getBoundingClientRect();
+    if (elRect.width === 0 && elRect.height === 0) return null;
+    var rel = anchor.rel && typeof anchor.rel.x === 'number' ? anchor.rel : { x: 0, y: 0 };
+    return { left: elRect.left + rel.x * elRect.width, top: elRect.top + rel.y * elRect.height };
   }
 
   // ---------- shadow DOM UI ----------
@@ -1068,7 +1125,56 @@
     '  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);',
     '  font: inherit;',
     '  font-size: 0.8rem;',
-    '}'
+    '}',
+    '.cm-highlight-box {',
+    '  position: absolute;',
+    '  background: rgba(37, 99, 235, 0.25);',
+    '  border-radius: 2px;',
+    '  pointer-events: none;',
+    '  z-index: 2147481000;',
+    '}',
+    '.cm-orphan-toggle {',
+    '  position: fixed;',
+    '  left: 16px;',
+    '  bottom: 16px;',
+    '  z-index: 2147483000;',
+    '  min-height: 44px;',
+    '  padding: 10px 18px;',
+    '  border-radius: 999px;',
+    '  border: 1px solid #b45309;',
+    '  background: #fffbeb;',
+    '  color: #b45309;',
+    '  font: inherit;',
+    '  cursor: pointer;',
+    '  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);',
+    '}',
+    '.cm-orphan-panel {',
+    '  position: fixed;',
+    '  left: 0;',
+    '  right: 0;',
+    '  bottom: 0;',
+    '  z-index: 2147483600;',
+    '  background: #fff;',
+    '  border-radius: 14px 14px 0 0;',
+    '  box-shadow: 0 -2px 20px rgba(0, 0, 0, 0.25);',
+    '  padding: 16px;',
+    '  max-height: 70vh;',
+    '  overflow-y: auto;',
+    '}',
+    '.cm-orphan-item { padding: 10px 0; border-bottom: 1px solid #eee; }',
+    '.cm-orphan-quote { margin: 0 0 4px; font-size: 0.85rem; color: #444; }',
+    '.cm-orphan-text { margin: 0 0 8px; white-space: pre-wrap; }',
+    '.cm-orphan-actions { display: flex; gap: 8px; }',
+    '.cm-orphan-actions button {',
+    '  min-height: 40px;',
+    '  padding: 8px 12px;',
+    '  border-radius: 8px;',
+    '  border: 1px solid #ccc;',
+    '  background: #f3f4f6;',
+    '  font: inherit;',
+    '  cursor: pointer;',
+    '}',
+    '.cm-orphan-repin { background: #2563eb !important; color: #fff; border-color: #2563eb !important; }'
   ].join('\n');
 
   function buildUI() {
@@ -1103,8 +1209,27 @@
     showResolvedLabel.appendChild(document.createTextNode('Show resolved'));
     root.appendChild(showResolvedLabel);
 
+    // Below the pins layer in z-index (see CSS_TEXT), so a highlight box
+    // never intercepts a tap meant for a pin or the sheet.
+    var highlightLayer = document.createElement('div');
+    root.appendChild(highlightLayer);
+
     var pinsLayer = document.createElement('div');
     root.appendChild(pinsLayer);
+
+    // Hidden until renderPins finds at least one orphaned comment (see
+    // renderOrphanPanel). Placed on the opposite corner from the main
+    // toggle so the two never overlap.
+    var orphanToggle = document.createElement('button');
+    orphanToggle.type = 'button';
+    orphanToggle.className = 'cm-orphan-toggle';
+    orphanToggle.hidden = true;
+    root.appendChild(orphanToggle);
+
+    var orphanPanel = document.createElement('div');
+    orphanPanel.className = 'cm-orphan-panel';
+    orphanPanel.hidden = true;
+    root.appendChild(orphanPanel);
 
     return {
       host: host,
@@ -1112,7 +1237,10 @@
       root: root,
       toggle: toggle,
       showResolvedCheckbox: showResolvedCheckbox,
-      pinsLayer: pinsLayer
+      pinsLayer: pinsLayer,
+      highlightLayer: highlightLayer,
+      orphanToggle: orphanToggle,
+      orphanPanel: orphanPanel
     };
   }
 
@@ -1139,9 +1267,50 @@
     var sheetEl = null;
     var pendingAnchor = null;
     var showResolved = false;
+    // Set by the orphan panel's "Re-pin" action to the comment awaiting a
+    // fresh anchor; the next resolved tap replaces that comment's anchor
+    // instead of creating a new comment (see the click handler below).
+    var rePinTarget = null;
+    // The anchor showHighlightForAnchor last drew boxes for, so renderPins
+    // (resize/rotation/host-mutation re-anchoring) can redraw them at their
+    // post-reflow position instead of leaving them stuck where the page was
+    // before the sheet was opened.
+    var highlightedAnchor = null;
 
     function isInsideOwnUI(target) {
       return !!(ui && target && target.nodeType === 1 && ui.host.contains(target));
+    }
+
+    function clearHighlight() {
+      if (ui) ui.highlightLayer.innerHTML = '';
+    }
+
+    // Highlights the actual extent of a stored anchor on the page, not just
+    // its containing block — reopening a pin used to outline the whole
+    // block (a known prototype gap; see the a6 prototype's README), which is
+    // misleading for a sentence or word scope inside a long paragraph.
+    // `getClientRects()` (rather than `getBoundingClientRect()`) is used for
+    // a Range so a quote that wraps across lines highlights each line, not
+    // one box spanning the gap between them.
+    function showHighlightForAnchor(anchor) {
+      if (!ui) return;
+      highlightedAnchor = anchor;
+      clearHighlight();
+      var pageIndex = buildTextIndex(document.body);
+      var target = locateAnchorTarget(anchor, pageIndex);
+      if (!target) return;
+      var rects = target.type === 'range' ? target.range.getClientRects() : [target.el.getBoundingClientRect()];
+      for (var i = 0; i < rects.length; i++) {
+        var r = rects[i];
+        if (r.width === 0 && r.height === 0) continue;
+        var box = document.createElement('div');
+        box.className = 'cm-highlight-box';
+        box.style.left = r.left + global.scrollX + 'px';
+        box.style.top = r.top + global.scrollY + 'px';
+        box.style.width = r.width + 'px';
+        box.style.height = r.height + 'px';
+        ui.highlightLayer.appendChild(box);
+      }
     }
 
     function closeSheet() {
@@ -1150,16 +1319,23 @@
         sheetEl = null;
       }
       pendingAnchor = null;
+      highlightedAnchor = null;
+      clearHighlight();
     }
 
     function truncate(text, max) {
       return text.length > max ? text.slice(0, max - 1) + '…' : text;
     }
 
+    // Returns false when a comment has a structurally valid anchor (a quote
+    // to search for) but neither the quote nor its cssPath fallback locates
+    // it on the current page — i.e. it's orphaned (see renderPins/
+    // renderOrphanPanel). A comment with no valid anchor shape at all
+    // (malformed/tampered storage) returns true: that's a data problem, not
+    // a re-anchoring failure, and was already silently skipped before
+    // FOR-443 — it must not now show up in the orphan panel with nothing
+    // sensible to display.
     function renderPin(comment, pageIndex) {
-      // A single malformed stored comment (missing/invalid anchor, e.g. from
-      // a future format or manual tampering) must not abort rendering the
-      // rest, nor abort init() itself — skip it instead.
       try {
         if (
           !comment ||
@@ -1167,15 +1343,15 @@
           !comment.anchor.quote ||
           typeof comment.anchor.quote.exact !== 'string'
         ) {
-          return;
+          return true;
         }
-        var rect = resolveAnchorRect(comment.anchor, pageIndex);
-        if (!rect || (rect.width === 0 && rect.height === 0)) return;
+        var pos = resolveAnchorPosition(comment.anchor, pageIndex);
+        if (!pos) return false;
         var pin = document.createElement('div');
         pin.className = 'cm-pin';
         pin.title = comment.text;
-        pin.style.left = rect.left + global.scrollX + 'px';
-        pin.style.top = rect.top + global.scrollY + 'px';
+        pin.style.left = pos.left + global.scrollX + 'px';
+        pin.style.top = pos.top + global.scrollY + 'px';
         // Reopening a pin is how editing/deleting an existing comment
         // happens (see openSheet's 'edit' mode below). This isn't gated on
         // `active`: placing a *new* comment requires comment mode to be on,
@@ -1186,9 +1362,72 @@
           openSheet('edit', { comment: comment });
         });
         ui.pinsLayer.appendChild(pin);
+        return true;
       } catch (e) {
         // Skip this comment; other comments still render.
+        return true;
       }
+    }
+
+    function renderOrphanPanel(orphanedComments) {
+      if (!ui) return;
+      ui.orphanToggle.hidden = orphanedComments.length === 0;
+      ui.orphanToggle.textContent = 'Orphaned (' + orphanedComments.length + ')';
+      if (orphanedComments.length === 0) ui.orphanPanel.hidden = true;
+      ui.orphanPanel.innerHTML = '';
+      orphanedComments.forEach(function (comment) {
+        var item = document.createElement('div');
+        item.className = 'cm-orphan-item';
+
+        var quote = document.createElement('p');
+        quote.className = 'cm-orphan-quote';
+        quote.textContent = '“' + truncate(comment.anchor.quote.exact, 160) + '”';
+        item.appendChild(quote);
+
+        var text = document.createElement('p');
+        text.className = 'cm-orphan-text';
+        text.textContent = comment.text;
+        item.appendChild(text);
+
+        var actions = document.createElement('div');
+        actions.className = 'cm-orphan-actions';
+
+        var rePinBtn = document.createElement('button');
+        rePinBtn.type = 'button';
+        rePinBtn.className = 'cm-orphan-repin';
+        rePinBtn.textContent = 'Re-pin';
+        rePinBtn.addEventListener('click', function () {
+          ui.orphanPanel.hidden = true;
+          rePinTarget = comment;
+          if (!active) setActive(true);
+        });
+        actions.appendChild(rePinBtn);
+
+        var resolveBtn = document.createElement('button');
+        resolveBtn.type = 'button';
+        resolveBtn.textContent = comment.resolved ? 'Reopen' : 'Resolve';
+        resolveBtn.addEventListener('click', function () {
+          comment.resolved = !comment.resolved;
+          comment.updatedAt = new Date().toISOString();
+          saveComments(storageKey, comments);
+          renderPins();
+        });
+        actions.appendChild(resolveBtn);
+
+        var delBtn = document.createElement('button');
+        delBtn.type = 'button';
+        delBtn.textContent = 'Delete';
+        delBtn.addEventListener('click', function () {
+          comment.deleted = true;
+          comment.updatedAt = new Date().toISOString();
+          saveComments(storageKey, comments);
+          renderPins();
+        });
+        actions.appendChild(delBtn);
+
+        item.appendChild(actions);
+        ui.orphanPanel.appendChild(item);
+      });
     }
 
     function renderPins() {
@@ -1201,31 +1440,48 @@
       // A deleted comment stays in storage (see openSheet's delete handler)
       // but is never rendered, so it's never shown in any list either. A
       // resolved comment stays too, but is only rendered when the
-      // show-resolved switch is on (see CONTEXT.md's "Resolved" entry).
+      // show-resolved switch is on (see CONTEXT.md's "Resolved" entry). Only
+      // a comment that would otherwise be shown can be orphaned: a resolved
+      // comment hidden by the switch isn't surfaced as needing attention.
+      var orphaned = [];
       comments.forEach(function (comment) {
         if (comment && comment.deleted) return;
         if (comment && comment.resolved && !showResolved) return;
-        renderPin(comment, pageIndex);
+        if (!renderPin(comment, pageIndex)) orphaned.push(comment);
       });
+      renderOrphanPanel(orphaned);
+      // A highlight drawn for an open edit sheet is boxes at fixed
+      // coordinates (see showHighlightForAnchor); redraw it at its
+      // anchor's current position whenever re-anchoring runs, so a
+      // resize/rotation/host-mutation while the sheet is still open doesn't
+      // leave it visibly stuck where the page used to be.
+      if (highlightedAnchor) showHighlightForAnchor(highlightedAnchor);
     }
 
     // `mode` is 'create' (placing a new comment on a freshly resolved
     // anchor, where `data.context` is what resolveTap produced — the tapped
-    // block/position and the ordered list of scopes available from here) or
+    // block/position and the ordered list of scopes available from here),
     // 'edit' (reopened from an existing comment's pin, to change its
-    // text/sentiment or delete it). There's no `context` in edit mode, so
-    // the −/+ scope controls are disabled there: the anchor quote is always
-    // read-only display, never itself editable on an existing comment
-    // (scope resize is later ticket scope). The −/+ controls, when enabled,
+    // text/sentiment or delete it), or 'repin' (reopened from the orphan
+    // panel's "Re-pin" action: an existing comment whose new anchor, just
+    // resolved from a fresh tap, replaces its old one on Save — see the
+    // click handler below and the save button's handler further down).
+    // 'edit' has no `context` to step through, so the −/+ scope controls are
+    // disabled there: the anchor quote is read-only display, never itself
+    // editable on an existing comment's original placement (scope resize is
+    // later ticket scope) — 'repin' does have one, since its anchor is fresh
+    // rather than the comment's stored one, so scope stepping works exactly
+    // as it does when creating a comment. The −/+ controls, when enabled,
     // only ever move `context.levelIndex` and recompute the anchor for the
     // new scope; they never re-resolve the original tap.
     function openSheet(mode, data) {
       closeSheet();
-      var isEdit = mode === 'edit';
+      var isEdit = mode === 'edit' || mode === 'repin';
       var comment = isEdit ? data.comment : null;
-      var context = isEdit ? null : data.context;
-      var anchor = isEdit ? comment.anchor : data.anchor;
+      var context = mode === 'edit' ? null : data.context;
+      var anchor = mode === 'edit' ? comment.anchor : data.anchor;
       pendingAnchor = anchor;
+      if (mode === 'edit') showHighlightForAnchor(anchor);
 
       var sheet = document.createElement('div');
       sheet.className = 'cm-sheet';
@@ -1297,7 +1553,7 @@
       // otherwise discard whatever the sheet's own textarea/sentiment/reply
       // draft holds unsaved.
       var resolvedBadge = null;
-      if (isEdit) {
+      if (mode === 'edit') {
         resolvedBadge = document.createElement('span');
         resolvedBadge.className = 'cm-resolved-badge';
         resolvedBadge.textContent = 'Resolved';
@@ -1339,7 +1595,7 @@
       var actions = document.createElement('div');
       actions.className = 'cm-actions';
 
-      if (isEdit) {
+      if (mode === 'edit') {
         var resolveBtn = document.createElement('button');
         resolveBtn.type = 'button';
         resolveBtn.className = 'cm-resolve';
@@ -1382,7 +1638,12 @@
       var cancel = document.createElement('button');
       cancel.type = 'button';
       cancel.textContent = 'Cancel';
-      cancel.addEventListener('click', closeSheet);
+      cancel.addEventListener('click', function () {
+        // Cancelling a re-pin drops the pending target entirely, rather than
+        // leaving the next unrelated tap silently re-anchor it.
+        if (mode === 'repin') rePinTarget = null;
+        closeSheet();
+      });
       actions.appendChild(cancel);
 
       var save = document.createElement('button');
@@ -1392,7 +1653,16 @@
       save.addEventListener('click', function () {
         var text = textarea.value.trim();
         if (!text) return;
-        if (isEdit) {
+        if (mode === 'repin') {
+          // The anchor always changes here (that's the point of re-pinning),
+          // so unlike a plain edit this always writes, even if the text and
+          // sentiment are untouched.
+          comment.anchor = pendingAnchor;
+          comment.text = text;
+          comment.sentiment = currentSentiment;
+          comment.updatedAt = new Date().toISOString();
+          rePinTarget = null;
+        } else if (isEdit) {
           var changed = text !== comment.text || currentSentiment !== comment.sentiment;
           if (!changed) {
             closeSheet();
@@ -1505,7 +1775,13 @@
         ui.toggle.textContent = active ? 'Exit comment mode' : 'Comment mode';
       }
       document.documentElement.classList.toggle('comment-mode-active', active);
-      if (!active) closeSheet();
+      if (!active) {
+        closeSheet();
+        // A re-pin needs an active tap to complete; leaving placement mode
+        // abandons it rather than silently re-anchoring some later,
+        // unrelated tap once comment mode is switched on again.
+        rePinTarget = null;
+      }
     }
 
     // Blocking selection has to happen as early as pointerdown, before the
@@ -1535,6 +1811,10 @@
         if (!context) return;
         var anchor = computeAnchorForScope(context, context.levels[context.levelIndex]);
         if (!anchor) return;
+        if (rePinTarget) {
+          openSheet('repin', { context: context, anchor: anchor, comment: rePinTarget });
+          return;
+        }
         openSheet('create', { context: context, anchor: anchor });
       },
       { capture: true }
@@ -1554,6 +1834,33 @@
     // init() is called from a <head> inline script. Defer that (and
     // everything depending on it) until the DOM is ready, so init() never
     // throws regardless of where it's called from.
+    // Re-anchoring is what keeps a pin correct after the page changes under
+    // it, so renderPins needs to run again whenever that might have
+    // happened: a resize or rotation (the viewport changed, so every rect
+    // did), or a host DOM mutation (the host re-rendered its own content,
+    // possibly with different text). Debounced, since a resize fires
+    // continuously while dragging and a host re-render can touch many nodes
+    // in one pass — either would otherwise rebuild the whole-page text index
+    // on every single event. A plain reset-on-every-call debounce never
+    // fires at all against a host that mutates continuously (a live
+    // countdown, a streaming log) — reanchorMaxTimer isn't reset by
+    // scheduleReanchor, so it forces a flush at most 1s after the first
+    // pending change, however many more arrive in between.
+    var reanchorTimer = null;
+    var reanchorMaxTimer = null;
+    function flushReanchor() {
+      clearTimeout(reanchorTimer);
+      clearTimeout(reanchorMaxTimer);
+      reanchorTimer = null;
+      reanchorMaxTimer = null;
+      renderPins();
+    }
+    function scheduleReanchor() {
+      clearTimeout(reanchorTimer);
+      reanchorTimer = setTimeout(flushReanchor, 120);
+      if (!reanchorMaxTimer) reanchorMaxTimer = setTimeout(flushReanchor, 1000);
+    }
+
     function attachUI() {
       ui = buildUI();
       ui.toggle.addEventListener('click', function () {
@@ -1562,6 +1869,20 @@
       ui.showResolvedCheckbox.addEventListener('change', function () {
         showResolved = ui.showResolvedCheckbox.checked;
         renderPins();
+      });
+      ui.orphanToggle.addEventListener('click', function () {
+        ui.orphanPanel.hidden = !ui.orphanPanel.hidden;
+      });
+      global.addEventListener('resize', scheduleReanchor);
+      global.addEventListener('orientationchange', scheduleReanchor);
+      // Observing document.body's subtree never sees into comment mode's own
+      // shadow root (a separate tree from the light DOM), so renderPins
+      // rebuilding ui.pinsLayer's contents can't re-trigger this observer
+      // itself.
+      new MutationObserver(scheduleReanchor).observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true
       });
       renderPins();
     }
