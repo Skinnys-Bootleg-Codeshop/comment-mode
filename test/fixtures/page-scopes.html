@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="comment-mode:page-id" content="scopes-fixture">
+<title>Comment mode scopes fixture</title>
+</head>
+<body>
+<main>
+  <h1 id="h1-top">Report</h1>
+  <p id="hyphen-para">This is a well-known result worth noting.</p>
+  <div id="span-wrapped"><span id="span-wrapped-text">All of this text is inside a span.</span></div>
+
+  <h2 id="h2-evidence">Evidence</h2>
+  <p id="evidence-para">Some supporting detail goes here.</p>
+  <table id="evidence-table"><tbody><tr><td id="cell-a">Alpha</td><td id="cell-b">Beta</td></tr></tbody></table>
+  <ul id="evidence-list"><li id="item-a">First item</li><li id="item-b">Second item</li></ul>
+  <pre id="code-block">const x = 1;
+const y = 2;</pre>
+
+  <h2 id="h2-visuals">Visuals</h2>
+  <img id="fixture-image" alt="A mockup of the digest email" width="200" height="100" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='100'%3E%3Crect width='200' height='100' fill='%23ccc'/%3E%3C/svg%3E">
+
+  <h2 id="h2-notes">Notes</h2>
+  <p id="before-gap">Text before a big gap.</p>
+  <div id="whitespace-gap" style="height:220px;"></div>
+  <p id="after-gap">Text after a big gap.</p>
+</main>
+<script src="/comment-mode.js"></script>
+<script>
+  window.commentModeInstance = window.CommentMode.init();
+</script>
+</body>
+</html>

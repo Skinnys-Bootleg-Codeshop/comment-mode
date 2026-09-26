@@ -408,3 +408,201 @@ test.describe('malformed stored comments', () => {
     expect(pinCount).toBe(1);
   });
 });
+
+test.describe('scopes', () => {
+  // Taps land on the midpoint of a specific word's glyphs, computed from the
+  // element's own first text node, so these tests don't depend on the
+  // element's overall bounding box (which can span several words).
+  async function tapPointOnWord(page, elementId, word) {
+    return page.evaluate(
+      ({ elementId, word }) => {
+        const el = document.getElementById(elementId);
+        const textNode = el.firstChild;
+        const idx = textNode.nodeValue.indexOf(word);
+        const mid = idx + Math.floor(word.length / 2);
+        const range = document.createRange();
+        range.setStart(textNode, mid);
+        range.setEnd(textNode, mid + 1);
+        const rect = range.getBoundingClientRect();
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      },
+      { elementId, word }
+    );
+  }
+
+  function scopeLabel(page) {
+    return page.locator('[data-comment-mode-host]').locator('.cm-scope-label');
+  }
+  function quoteText(page) {
+    return page.locator('[data-comment-mode-host]').locator('.cm-quote');
+  }
+  function narrowButton(page) {
+    return page.locator('[data-comment-mode-host]').getByRole('button', { name: 'Narrow scope' });
+  }
+  function widenButton(page) {
+    return page.locator('[data-comment-mode-host]').getByRole('button', { name: 'Widen scope' });
+  }
+
+  test('default scope is sentence for a tap on text, and the −/+ controls step word/sentence/block/section with a live quote preview', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    const point = await tapPointOnWord(page, 'intro', 'second');
+    await page.touchscreen.tap(point.x, point.y);
+
+    await expect(scopeLabel(page)).toHaveText('sentence');
+    await expect(quoteText(page)).toContainText('second sentence');
+
+    // Widen: sentence -> block. The whole paragraph, all three sentences.
+    await widenButton(page).tap();
+    await expect(scopeLabel(page)).toHaveText('block');
+    await expect(quoteText(page)).toContainText('first sentence');
+    await expect(quoteText(page)).toContainText('second sentence');
+    await expect(quoteText(page)).toContainText('third one');
+
+    // Widen: block -> section. #intro's page has a single heading, so the
+    // section covers the rest of the body too — including content well past
+    // the 160-character preview truncation, so assert on the section's
+    // start (still visible in the truncated preview) and its overall length
+    // rather than text further in.
+    const blockQuoteLength = (await quoteText(page).textContent()).length;
+    await widenButton(page).tap();
+    await expect(scopeLabel(page)).toHaveText('section');
+    await expect(quoteText(page)).toContainText('Weekly Digest Email');
+    const sectionQuoteLength = (await quoteText(page).textContent()).length;
+    expect(sectionQuoteLength).toBeGreaterThan(blockQuoteLength);
+    await expect(widenButton(page)).toBeDisabled();
+
+    // Narrow back down: section -> block -> sentence -> word.
+    await narrowButton(page).tap();
+    await expect(scopeLabel(page)).toHaveText('block');
+    await narrowButton(page).tap();
+    await expect(scopeLabel(page)).toHaveText('sentence');
+    await expect(quoteText(page)).toContainText('second sentence');
+    await narrowButton(page).tap();
+    await expect(scopeLabel(page)).toHaveText('word');
+    await expect(quoteText(page)).toContainText('second');
+    await expect(quoteText(page)).not.toContainText('sentence');
+    await expect(narrowButton(page)).toBeDisabled();
+  });
+
+  test('a tap on text whose block wraps it entirely in an inline element still resolves a block', async ({ page }) => {
+    // Regression: isBlockEl's div/main/... branch must not require a block's
+    // text to be a *direct* child text node. A <div><span>...</span></div>
+    // has all its text nested one level deeper, inside an inline <span>
+    // that never itself qualifies as a block; the div must still be found.
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    const point = await tapPointOnWord(page, 'span-wrapped-text', 'inside');
+    await page.touchscreen.tap(point.x, point.y);
+
+    await expect(scopeLabel(page)).toHaveText('sentence');
+    await expect(quoteText(page)).toContainText('All of this text is inside a span.');
+  });
+
+  test('a hyphenated word stays whole at word scope', async ({ page }) => {
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    const point = await tapPointOnWord(page, 'hyphen-para', 'well-known');
+    await page.touchscreen.tap(point.x, point.y);
+    await narrowButton(page).tap();
+
+    await expect(scopeLabel(page)).toHaveText('word');
+    await expect(quoteText(page)).toContainText('well-known');
+  });
+
+  test('a tap in a code block resolves word scope to a single token, not the whole block', async ({ page }) => {
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    const point = await tapPointOnWord(page, 'code-block', 'y');
+    await page.touchscreen.tap(point.x, point.y);
+    await narrowButton(page).tap();
+
+    await expect(scopeLabel(page)).toHaveText('word');
+    const text = await quoteText(page).textContent();
+    expect(text).toContain('y');
+    expect(text).not.toContain('const x');
+  });
+
+  test('a tap on an image defaults to block scope, describes the image, and cannot narrow further', async ({ page }) => {
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    const box = await page.locator('#fixture-image').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2);
+
+    await expect(scopeLabel(page)).toHaveText('block');
+    await expect(quoteText(page)).toContainText('digest email');
+    await expect(narrowButton(page)).toBeDisabled();
+
+    await widenButton(page).tap();
+    await expect(scopeLabel(page)).toHaveText('section');
+  });
+
+  test('saving a comment on an image shows a pin, since its description is never literally on the page', async ({ page }) => {
+    // Regression: an image anchor's quote ("[image: ...]") can never be
+    // found by a text search, so rendering its pin must fall back to the
+    // anchor's stored CSS path instead of silently rendering nothing.
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    const box = await page.locator('#fixture-image').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2);
+    await page.locator('textarea').fill('Nice mockup.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    const pinCount = await page.evaluate(() => {
+      const host = document.querySelector('[data-comment-mode-host]');
+      return host.shadowRoot.querySelectorAll('.cm-pin').length;
+    });
+    expect(pinCount).toBe(1);
+  });
+
+  test('a tap in whitespace resolves to the nearest block at block scope, flagged near', async ({ page }) => {
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    const box = await page.locator('#whitespace-gap').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width / 2, box.y + 5);
+
+    await expect(scopeLabel(page)).toHaveText('block');
+    await expect(quoteText(page)).toContainText('(near)');
+
+    await page.locator('textarea').fill('Nearest block, not exact.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    const stored = await page.evaluate(() =>
+      localStorage.getItem('comment-mode:comments:scopes-fixture')
+    );
+    const comments = JSON.parse(stored);
+    expect(comments[0].anchor.near).toBe(true);
+    expect(comments[0].anchor.scope).toBe('block');
+    expect(comments[0].anchor.quote.exact).toBe('Text before a big gap.');
+  });
+
+  test('table cells and list items keep their boundaries at section scope, instead of running together', async ({ page }) => {
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    const point = await tapPointOnWord(page, 'cell-a', 'Alpha');
+    await page.touchscreen.tap(point.x, point.y);
+    // sentence -> block -> section
+    await widenButton(page).tap();
+    await widenButton(page).tap();
+
+    await expect(scopeLabel(page)).toHaveText('section');
+    const text = await quoteText(page).textContent();
+    expect(text).toMatch(/Alpha\s+Beta/);
+    expect(text).not.toContain('AlphaBeta');
+    expect(text).toMatch(/First item\s+Second item/);
+    expect(text).not.toContain('itemSecond');
+    // The next section's heading and content must not have leaked in.
+    expect(text).not.toContain('Visuals');
+  });
+});
