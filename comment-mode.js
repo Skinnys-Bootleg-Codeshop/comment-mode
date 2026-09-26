@@ -673,8 +673,8 @@
   // Where a tap fell within a block's own rect, as fractions clamped to
   // [0, 1]. Stored on an anchor as `rel` instead of any absolute pixels, so
   // it stays meaningful after the page reflows: only the structural
-  // (cssPath) re-anchoring path uses it (see resolveAnchorPosition below),
-  // since a text-quote anchor is already positioned precisely by its own
+  // (cssPath) re-anchoring path uses it (see positionForTarget below), since
+  // a text-quote anchor is already positioned precisely by its own
   // re-found Range.
   function relativePositionInBlock(clientX, clientY, rect) {
     if (!rect || rect.width === 0 || rect.height === 0) return { x: 0, y: 0 };
@@ -914,7 +914,7 @@
   // path and collide. `:scope > ` anchors the first step to an actual direct
   // child of body, matching how the path was built.
   //
-  // Shared by resolveAnchorPosition (pin placement) and
+  // Shared by renderPin (via positionForTarget, for pin placement) and
   // showHighlightForAnchor (reopened-pin highlight), so the two never
   // disagree about what "found" means.
   function locateAnchorTarget(anchor, pageIndex) {
@@ -933,18 +933,28 @@
     return null;
   }
 
-  // Finds where a stored anchor currently is on the page, as a point a pin
-  // can be placed at. A text-quote anchor is positioned by its own re-found
-  // Range — `Range.selectNodeContents` on a childless element like <img>
-  // produces a zero-size range regardless of how large the image actually
-  // renders, which is why a structural anchor is positioned differently: at
+  function validRelComponent(n) {
+    return typeof n === 'number' && isFinite(n) ? Math.max(0, Math.min(1, n)) : 0;
+  }
+
+  // Finds where an already-located anchor target is, as a point a pin can be
+  // placed at, or null when it's currently zero-size (e.g. a `hidden`
+  // ancestor, a collapsed accordion): found, but not something a pin can sit
+  // on right now. That's distinct from not being found at all (see
+  // locateAnchorTarget) — a comment behind a closed accordion isn't
+  // orphaned, it's just not shown until the page reveals it again (the next
+  // re-anchor after that catches it, since renderPins re-locates on every
+  // run rather than caching the result).
+  //
+  // A text-quote anchor is positioned by its own re-found Range —
+  // `Range.selectNodeContents` on a childless element like <img> produces a
+  // zero-size range regardless of how large the image actually renders,
+  // which is why a structural anchor is positioned differently: at
   // `anchor.rel`'s fraction across its resolved element's own rect (see
   // relativePositionInBlock), rather than always the element's top-left
   // corner, so the pin lands close to where the block was originally tapped
   // even though the element carries no text a Range could be built from.
-  function resolveAnchorPosition(anchor, pageIndex) {
-    var target = locateAnchorTarget(anchor, pageIndex);
-    if (!target) return null;
+  function positionForTarget(target, anchor) {
     if (target.type === 'range') {
       var rect = target.range.getBoundingClientRect();
       if (rect.width === 0 && rect.height === 0) return null;
@@ -952,8 +962,11 @@
     }
     var elRect = target.el.getBoundingClientRect();
     if (elRect.width === 0 && elRect.height === 0) return null;
-    var rel = anchor.rel && typeof anchor.rel.x === 'number' ? anchor.rel : { x: 0, y: 0 };
-    return { left: elRect.left + rel.x * elRect.width, top: elRect.top + rel.y * elRect.height };
+    var rel = anchor.rel || {};
+    return {
+      left: elRect.left + validRelComponent(rel.x) * elRect.width,
+      top: elRect.top + validRelComponent(rel.y) * elRect.height
+    };
   }
 
   // ---------- shadow DOM UI ----------
@@ -1271,6 +1284,11 @@
     // fresh anchor; the next resolved tap replaces that comment's anchor
     // instead of creating a new comment (see the click handler below).
     var rePinTarget = null;
+    // The mode the currently-open sheet was opened with, so closeSheet can
+    // tell a pending re-pin was abandoned regardless of *how* the sheet
+    // closed (Cancel, Save, or a tap outside it to dismiss) rather than only
+    // the paths that used to clear rePinTarget explicitly.
+    var openSheetMode = null;
     // The anchor showHighlightForAnchor last drew boxes for, so renderPins
     // (resize/rotation/host-mutation re-anchoring) can redraw them at their
     // post-reflow position instead of leaving them stuck where the page was
@@ -1318,6 +1336,11 @@
         sheetEl.remove();
         sheetEl = null;
       }
+      // A re-pin sheet closing for any reason without having saved
+      // abandons it: leaving it armed would silently re-anchor whatever
+      // unrelated tap comes next (see the FOR-443 review).
+      if (openSheetMode === 'repin') rePinTarget = null;
+      openSheetMode = null;
       pendingAnchor = null;
       highlightedAnchor = null;
       clearHighlight();
@@ -1329,24 +1352,31 @@
 
     // Returns false when a comment has a structurally valid anchor (a quote
     // to search for) but neither the quote nor its cssPath fallback locates
-    // it on the current page — i.e. it's orphaned (see renderPins/
+    // it anywhere on the current page — i.e. it's orphaned (see renderPins/
     // renderOrphanPanel). A comment with no valid anchor shape at all
-    // (malformed/tampered storage) returns true: that's a data problem, not
-    // a re-anchoring failure, and was already silently skipped before
-    // FOR-443 — it must not now show up in the orphan panel with nothing
-    // sensible to display.
+    // (malformed/tampered storage, or a quote that's the empty string with
+    // no path to fall back to) returns true: that's a data problem, not a
+    // re-anchoring failure, and was already silently skipped before FOR-443
+    // — it must not now show up in the orphan panel with nothing sensible to
+    // display. A comment whose anchor *is* found, but currently has no size
+    // (behind a `hidden` ancestor, inside a collapsed accordion), also
+    // returns true: it isn't orphaned, it's just not shown right now (see
+    // positionForTarget).
     function renderPin(comment, pageIndex) {
       try {
         if (
           !comment ||
           !comment.anchor ||
           !comment.anchor.quote ||
-          typeof comment.anchor.quote.exact !== 'string'
+          typeof comment.anchor.quote.exact !== 'string' ||
+          (!comment.anchor.quote.exact && !comment.anchor.path)
         ) {
           return true;
         }
-        var pos = resolveAnchorPosition(comment.anchor, pageIndex);
-        if (!pos) return false;
+        var target = locateAnchorTarget(comment.anchor, pageIndex);
+        if (!target) return false;
+        var pos = positionForTarget(target, comment.anchor);
+        if (!pos) return true;
         var pin = document.createElement('div');
         pin.className = 'cm-pin';
         pin.title = comment.text;
@@ -1410,6 +1440,11 @@
           comment.resolved = !comment.resolved;
           comment.updatedAt = new Date().toISOString();
           saveComments(storageKey, comments);
+          // Resolving hides the comment again behind the show-resolved
+          // switch (see renderPins), so a re-pin still pending for it would
+          // otherwise write a fresh anchor onto a comment that stays hidden
+          // regardless — surprising, so it's abandoned instead.
+          if (rePinTarget === comment) rePinTarget = null;
           renderPins();
         });
         actions.appendChild(resolveBtn);
@@ -1421,6 +1456,11 @@
           comment.deleted = true;
           comment.updatedAt = new Date().toISOString();
           saveComments(storageKey, comments);
+          // Without this, a re-pin still pending for a just-deleted comment
+          // would write a fresh anchor and new text onto a record that never
+          // renders again (deleted stays true) — the tap's comment silently
+          // disappears into it (see the FOR-443 review).
+          if (rePinTarget === comment) rePinTarget = null;
           renderPins();
         });
         actions.appendChild(delBtn);
@@ -1476,6 +1516,7 @@
     // new scope; they never re-resolve the original tap.
     function openSheet(mode, data) {
       closeSheet();
+      openSheetMode = mode;
       var isEdit = mode === 'edit' || mode === 'repin';
       var comment = isEdit ? data.comment : null;
       var context = mode === 'edit' ? null : data.context;
@@ -1638,12 +1679,7 @@
       var cancel = document.createElement('button');
       cancel.type = 'button';
       cancel.textContent = 'Cancel';
-      cancel.addEventListener('click', function () {
-        // Cancelling a re-pin drops the pending target entirely, rather than
-        // leaving the next unrelated tap silently re-anchor it.
-        if (mode === 'repin') rePinTarget = null;
-        closeSheet();
-      });
+      cancel.addEventListener('click', closeSheet);
       actions.appendChild(cancel);
 
       var save = document.createElement('button');
@@ -1661,7 +1697,6 @@
           comment.text = text;
           comment.sentiment = currentSentiment;
           comment.updatedAt = new Date().toISOString();
-          rePinTarget = null;
         } else if (isEdit) {
           var changed = text !== comment.text || currentSentiment !== comment.sentiment;
           if (!changed) {
@@ -1878,11 +1913,16 @@
       // Observing document.body's subtree never sees into comment mode's own
       // shadow root (a separate tree from the light DOM), so renderPins
       // rebuilding ui.pinsLayer's contents can't re-trigger this observer
-      // itself.
+      // itself; nor does renderPins ever set an attribute on a light-DOM
+      // element (the only attribute it could touch, ui.host's, is set once
+      // at creation, before this observer starts). `attributes: true` is
+      // what catches a host re-render that moves content by toggling a
+      // class or inline style rather than touching text or child nodes.
       new MutationObserver(scheduleReanchor).observe(document.body, {
         childList: true,
         subtree: true,
-        characterData: true
+        characterData: true,
+        attributes: true
       });
       renderPins();
     }
