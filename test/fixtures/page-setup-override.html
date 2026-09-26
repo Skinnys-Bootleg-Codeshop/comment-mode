@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="comment-mode:page-id" content="from-head-meta">
+<title>Comment mode fixture — setup wins over head</title>
+</head>
+<body>
+  <main>
+    <p id="intro">Setup code should win over the head meta tag on this page.</p>
+  </main>
+  <script src="/comment-mode.js"></script>
+  <script>
+    window.commentModeInstance = window.CommentMode.init({
+      pageReference: { id: 'from-setup-code' }
+    });
+  </script>
+</body>
+</html>

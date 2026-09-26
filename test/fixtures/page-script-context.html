@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="comment-mode:page-id" content="script-context-fixture">
+<title>Comment mode fixture — script/style must never leak into anchor context</title>
+</head>
+<body>
+  <main>
+    <p id="before">Prefix visible sentence right before target.</p>
+    <script>window.hiddenBefore = "window.secretTokenBefore should never leak into an anchor";</script>
+    <p id="target">Target visible sentence for anchor testing.</p>
+    <script>window.hiddenAfter = "window.secretTokenAfter should never leak into an anchor";</script>
+    <style>.decoy { color: red; } /* window.styleToken should never leak either */</style>
+    <p id="after">Suffix visible sentence right after target.</p>
+  </main>
+  <script src="/comment-mode.js"></script>
+  <script>
+    window.commentModeInstance = window.CommentMode.init();
+  </script>
+</body>
+</html>

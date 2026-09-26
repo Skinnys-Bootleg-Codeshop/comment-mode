@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="comment-mode:page-id" content="from-head-meta-invalid-test">
+<title>Comment mode fixture — invalid explicit pageReference must throw, not fall back</title>
+</head>
+<body>
+  <main>
+    <p id="intro">Setup code supplies a malformed pageReference on this page.</p>
+  </main>
+  <script src="/comment-mode.js"></script>
+  <script>
+    window.commentModeInitError = null;
+    try {
+      window.commentModeInstance = window.CommentMode.init({
+        pageReference: { id: '', version: 'v9' }
+      });
+    } catch (e) {
+      window.commentModeInitError = e.message;
+    }
+  </script>
+</body>
+</html>
