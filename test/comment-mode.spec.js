@@ -1283,3 +1283,52 @@ test.describe('deleting a comment', () => {
     expect(stored[0].text).toBe('Delete me.');
   });
 });
+
+test.describe('deleted comments', () => {
+  // A deleted comment stays in storage as a tombstone (`deleted: true`), so
+  // it syncs like any other edit, but it must never render a pin.
+  test('a comment marked deleted does not render a pin', async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem(
+        'comment-mode:comments:fixture-page',
+        JSON.stringify([
+          {
+            id: 'removed',
+            anchor: {
+              quote: {
+                exact: 'This is the first sentence of the introduction.',
+                prefix: '',
+                suffix: ''
+              }
+            },
+            text: 'this was retracted',
+            deleted: true,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          },
+          {
+            id: 'kept',
+            anchor: {
+              quote: {
+                exact: 'This is the second sentence of the introduction.',
+                prefix: '',
+                suffix: ''
+              }
+            },
+            text: 'still visible',
+            createdAt: new Date().toISOString()
+          }
+        ])
+      );
+    });
+
+    await page.goto('/');
+
+    await expect(page.getByRole('button', { name: 'Comment mode', exact: true })).toBeVisible();
+    const pinCount = await page.evaluate(() => {
+      const host = document.querySelector('[data-comment-mode-host]');
+      return host.shadowRoot.querySelectorAll('.cm-pin').length;
+    });
+    expect(pinCount).toBe(1);
+  });
+});

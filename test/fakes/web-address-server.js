@@ -6,6 +6,7 @@
 'use strict';
 
 var http = require('http');
+var upsertById = require('./merge-by-id.js').upsertById;
 
 function keyFor(pageReference) {
   return JSON.stringify(pageReference);
@@ -16,17 +17,7 @@ function createWebAddressServer() {
 
   function upsert(pageReference, comments) {
     var key = keyFor(pageReference);
-    var byId = {};
-    (store[key] || []).forEach(function (c) { byId[c.id] = c; });
-    (comments || []).forEach(function (c) {
-      var existing = byId[c.id];
-      var incomingTime = c.updatedAt || c.createdAt || '';
-      var existingTime = existing ? (existing.updatedAt || existing.createdAt || '') : '';
-      if (!existing || incomingTime >= existingTime) {
-        byId[c.id] = c;
-      }
-    });
-    store[key] = Object.keys(byId).map(function (id) { return byId[id]; });
+    store[key] = upsertById(store[key], comments);
   }
 
   var server = http.createServer(function (req, res) {

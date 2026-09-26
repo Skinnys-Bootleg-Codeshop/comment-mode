@@ -184,22 +184,40 @@
 
   // ---------- sync engine ----------
   // A comment's sync timestamp is `updatedAt`, falling back to `createdAt`
-  // for today's tracer-bullet comments that don't have one yet.
+  // for today's tracer-bullet comments that don't have one yet. Both must be
+  // UTC ISO-8601 (`new Date().toISOString()`), the format every part of this
+  // module and its built-in plug-ins compare against. Timestamps are parsed
+  // with `Date.parse` rather than compared as raw strings, so two different
+  // string encodings of the same instant (or of unrelated formats) still
+  // compare correctly; a value that fails to parse sorts as the oldest
+  // possible instant rather than winning by accident. On an exact tie, the
+  // incoming (remote/newer-write) record wins, matching every plug-in this
+  // module ships.
   function commentTimestamp(comment) {
     return (comment && (comment.updatedAt || comment.createdAt)) || '';
   }
 
+  function parseTimestamp(value) {
+    var parsed = Date.parse(value || '');
+    return isNaN(parsed) ? -Infinity : parsed;
+  }
+
+  function incomingWinsTie(incoming, existing) {
+    return parseTimestamp(commentTimestamp(incoming)) >= parseTimestamp(commentTimestamp(existing));
+  }
+
   // Merges a local and a remote comment array by id: the record with the
-  // newest timestamp wins. A delete is just a record with `deleted: true`
-  // and a newer `updatedAt`, so it is never revived by an older record
-  // arriving later; no special-case delete logic is needed here. Local
-  // ordering is preserved; remote-only ids are appended at the end.
+  // newest timestamp wins, incoming wins an exact tie (see
+  // `incomingWinsTie`). A delete is just a record with `deleted: true` and a
+  // newer `updatedAt`, so it is never revived by an older record arriving
+  // later; no special-case delete logic is needed here. Local ordering is
+  // preserved; remote-only ids are appended at the end.
   function mergeComments(local, remote) {
     var byId = {};
     local.forEach(function (c) { byId[c.id] = c; });
     (remote || []).forEach(function (r) {
       var existing = byId[r.id];
-      if (!existing || commentTimestamp(r) > commentTimestamp(existing)) {
+      if (!existing || incomingWinsTie(r, existing)) {
         byId[r.id] = r;
       }
     });
@@ -219,11 +237,25 @@
   }
 
   // Drives comment mode's offline-first sync: local storage is always
-  // written first and is never blocked on the plug-in. `sync()` runs once at
-  // init to reconcile with the plug-in's store; `save()` attempts to push a
-  // local mutation and quietly marks it pending on failure instead of
-  // throwing; `flush()` retries a pending save and is wired to 'online' and
-  // visibility-change triggers when those globals are available.
+  // written first and is never blocked on the plug-in.
+  //
+  // `sync()` runs once at init to reconcile with the plug-in's store, and
+  // again on retry after a failed load, since a load that never happened
+  // means comment mode never learned what the plug-in has. `save()` attempts
+  // to push a local mutation and quietly marks it pending on failure instead
+  // of throwing. `flush()` is the single retry entry point wired to 'online'
+  // and visibility-change triggers: it re-runs the full `sync()` if the last
+  // load failed (`needsSync`), otherwise it just retries the pending save,
+  // so a save failure never masquerades as "we know what the plug-in has"
+  // and vice versa.
+  //
+  // A shared `pending` boolean would race: a slow-but-successful save for an
+  // earlier local state could clear it right after a fast-failing save for a
+  // newer one, and the newer failure would never be retried. `version` is a
+  // monotonically increasing counter bumped on every `save()` call; a save
+  // only clears `pending` when the version it was attempting is still the
+  // current version when it resolves, so a newer failure's `pending = true`
+  // is never erased by an older save's late success.
   function createSyncEngine(options) {
     options = options || {};
     var plugin = options.plugin;
@@ -234,31 +266,40 @@
     var eventTarget = options.eventTarget;
     var doc = options.document;
 
+    var version = 0;
     var pending = false;
+    var needsSync = false;
     var flushing = false;
 
-    function attemptSave(comments) {
+    function attemptSave(comments, myVersion) {
       if (!plugin || typeof plugin.save !== 'function') return Promise.resolve();
       return Promise.resolve()
         .then(function () { return plugin.save(pageReference, comments); })
         .then(function () {
-          pending = false;
+          if (myVersion === version) pending = false;
         })
         .catch(function () {
           pending = true;
         });
     }
 
-    function save(comments) {
-      return attemptSave(comments);
+    // Merges `remote` into local state (used by both `sync()`'s load and a
+    // plug-in's `subscribe` push) and re-renders when it actually changes
+    // anything.
+    function reconcile(remote) {
+      var local = getComments();
+      var merged = mergeComments(local, remote || []);
+      var changed = JSON.stringify(local) !== JSON.stringify(merged);
+      if (changed) {
+        setComments(merged);
+        if (onChange) onChange(merged);
+      }
+      return merged;
     }
 
-    function flush() {
-      if (flushing || !pending) return Promise.resolve();
-      flushing = true;
-      return attemptSave(getComments()).then(function () {
-        flushing = false;
-      });
+    function save(comments) {
+      version += 1;
+      return attemptSave(comments, version);
     }
 
     function sync() {
@@ -266,19 +307,31 @@
       return Promise.resolve()
         .then(function () { return plugin.load(pageReference); })
         .then(function (remote) {
-          var local = getComments();
-          var merged = mergeComments(local, remote || []);
-          var changed = JSON.stringify(local) !== JSON.stringify(merged);
-          if (changed) {
-            setComments(merged);
-            if (onChange) onChange(merged);
-          }
-          return attemptSave(merged);
+          needsSync = false;
+          var merged = reconcile(remote);
+          return attemptSave(merged, version);
         })
         .catch(function () {
-          // Load failed (offline, network error, ...): nothing to merge, so
-          // local comments stand as they are until the next retry trigger.
+          // Load failed (offline, network error, ...): comment mode doesn't
+          // know what the plug-in holds, so the next retry trigger must redo
+          // the whole load+merge+save, not just retry a save.
+          needsSync = true;
         });
+    }
+
+    // A plug-in's optional push-update channel: merge what it reports by the
+    // same newest-wins rule sync() uses, without waiting for a retry trigger.
+    function receiveChange(remote) {
+      reconcile(remote);
+    }
+
+    function flush() {
+      if (flushing || (!pending && !needsSync)) return Promise.resolve();
+      flushing = true;
+      var work = needsSync ? sync() : attemptSave(getComments(), version);
+      return work.then(function () {
+        flushing = false;
+      });
     }
 
     function handleRetryTrigger() {
@@ -298,7 +351,8 @@
       sync: sync,
       save: save,
       flush: flush,
-      isPending: function () { return pending; }
+      receiveChange: receiveChange,
+      isPending: function () { return pending || needsSync; }
     };
   }
 
@@ -1341,6 +1395,15 @@
     // rendered from local storage are the unchanged tracer-bullet UX.
     syncEngine.sync();
 
+    // A plug-in that supports push updates (subscribe is optional) gets its
+    // own changes merged in the same way as a sync() load, as soon as they
+    // arrive rather than waiting for the next retry trigger.
+    if (typeof plugin.subscribe === 'function') {
+      plugin.subscribe(pageReference, function (remoteComments) {
+        syncEngine.receiveChange(remoteComments);
+      });
+    }
+
     // The host may identify who's commenting this session (a name, plus an
     // optional id) and attach its own open metadata slot; both are stamped
     // onto every comment this session creates. Neither is validated beyond
@@ -1382,6 +1445,7 @@
       try {
         if (
           !comment ||
+          comment.deleted ||
           !comment.anchor ||
           !comment.anchor.quote ||
           typeof comment.anchor.quote.exact !== 'string'

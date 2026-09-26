@@ -15,9 +15,19 @@
 var test = require('node:test');
 var assert = require('node:assert/strict');
 
-var PAGE_REFERENCE = { id: 'contract-suite-page' };
+// A fresh id per call (not just per test) so the suite is re-runnable
+// against a persistent or real server: a fixed page reference would fail
+// "loading an unsaved page reference returns []" on a second run against a
+// store nothing wipes between runs.
+function uniqueRunId() {
+  return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+}
 
 function runStorageContractSuite(label, createPlugin) {
+  var runId = uniqueRunId();
+  var PAGE_REFERENCE = { id: 'contract-suite-page-' + runId };
+  var OTHER_PAGE_REFERENCE = { id: 'contract-suite-other-page-' + runId };
+
   test.describe(label, function () {
     test.it('loading a page reference nothing has been saved to returns an empty list', async function () {
       var plugin = await createPlugin();
@@ -109,6 +119,19 @@ function runStorageContractSuite(label, createPlugin) {
       var loaded = await plugin.load(PAGE_REFERENCE);
       assert.equal(loaded.length, 1);
       assert.deepEqual(loaded[0].replies, replies);
+    });
+
+    test.it('a save to one page reference does not leak into another', async function () {
+      var plugin = await createPlugin();
+      var comment = {
+        id: 'c5',
+        text: 'only for page A',
+        createdAt: '2024-01-01T00:00:00.000Z',
+        updatedAt: '2024-01-01T00:00:00.000Z'
+      };
+      await plugin.save(PAGE_REFERENCE, [comment]);
+      var otherPageLoaded = await plugin.load(OTHER_PAGE_REFERENCE);
+      assert.deepEqual(otherPageLoaded, []);
     });
   });
 }

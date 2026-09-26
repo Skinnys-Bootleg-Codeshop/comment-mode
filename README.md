@@ -92,18 +92,36 @@ A plug-in is a plain object with:
   duplicates. Upsert-by-id is the plug-in's own job; the two built-ins below
   implement it directly.
 - `subscribe(pageReference, onChange) -> unsubscribe()` (optional): call
-  `onChange(comments)` when the plug-in's store changes from elsewhere. A
-  plug-in that has no way to push updates simply omits this method.
+  `onChange(comments)` with the plug-in's current full comment array for that
+  page reference whenever its store changes from elsewhere. Comment mode
+  calls `subscribe` itself, once, if the plug-in has it, and merges every
+  `onChange` payload in with local state by the same newest-wins rule as a
+  sync load. A plug-in that has no way to push updates simply omits this
+  method.
 
-Comment mode syncs on init (load, merge with what's in `localStorage` by
-`id`, keeping whichever record has the newest `updatedAt`, falling back to
-`createdAt` when `updatedAt` is absent, then save the merged result back) and
-on every local mutation (save the new state; if that save fails, for example
-because the reader is offline, comment mode marks it pending and retries
-without blocking the UI, when the browser fires `online` or the page becomes
-visible again). Because conflicts resolve by newest `updatedAt`, a deleted
-comment (`deleted: true` with a newer `updatedAt`) is never revived by an
-older, non-deleted version of the same `id` arriving later.
+Comment mode syncs on init: load, merge with what's in `localStorage` by
+`id` (see "Conflicts" below), then save the merged result back. It syncs
+again, from scratch, if that load ever fails. On every local mutation it
+saves the new state; if that save fails, for example because the reader is
+offline, comment mode marks it pending and retries without blocking the UI,
+when the browser fires `online` or the page becomes visible again.
+
+**Timestamps.** `createdAt` and `updatedAt` must be UTC ISO-8601
+(`new Date().toISOString()`, e.g. `2024-01-02T03:04:05.678Z`). Every
+comparison in comment mode and its built-in plug-ins parses these with
+`Date.parse` rather than comparing the raw strings, so this is the format to
+match; a plug-in that stores or returns a different format will sort
+incorrectly against it.
+
+**Conflicts.** A merge (init sync, a push through `subscribe`, or a
+plug-in's own upsert) resolves per comment `id`: the record with the newest
+`updatedAt` wins, falling back to `createdAt` when `updatedAt` is absent. On
+an exact tie, the incoming record wins, whether "incoming" means the
+plug-in's copy during a sync merge or the newly-saved copy during a
+plug-in's own upsert. Because conflicts resolve this way, a deleted comment
+(`deleted: true` with a newer `updatedAt`) is never revived by an older,
+non-deleted version of the same `id` arriving later, with no special-case
+delete handling needed anywhere.
 
 ### Built-in plug-ins
 
@@ -166,13 +184,28 @@ A comment object carries at least `id` and a timestamp; the fuller shape
 saves by the parent comment's `id`; `replies` travel inside the parent
 record.
 
+**What the server behind this endpoint must do.** A POST's `comments` array
+is comment mode's current local knowledge, not a full replacement of what
+the server holds: the server must upsert by `id` into its own store, never
+delete or drop an id merely because a POST's array doesn't mention it (only
+an explicit `deleted: true` record removes a comment from view), and resolve
+each `id` by the same rule as comment mode itself: newest `updatedAt` wins
+(falling back to `createdAt`), timestamps parsed as UTC ISO-8601, incoming
+wins an exact tie. A server that instead does "last POST wins" verbatim will
+pass a naive idempotent-save check but fail newest-wins and delete-never-
+revived the first time two saves race, which is exactly what
+`test/contract-suite.js` (below) is built to catch.
+
 ### Writing your own plug-in
 
 `test/contract-suite.js` exports a reusable suite, `runStorageContractSuite`,
 that any plug-in must pass: loading an unsaved page reference, idempotent
 save, newest-`updatedAt`-wins conflicts, delete markers that are never
-revived, and replies round-tripping. Point it at your own plug-in factory to
-check it against the same contract comment-mode's built-ins are held to.
+revived, replies round-tripping, and page-reference isolation (a save to one
+page reference must never leak into another). It generates a fresh page
+reference on every run, so it's safe to run repeatedly against a real,
+persistent server. Point it at your own plug-in factory to check it against
+the same contract comment-mode's built-ins are held to.
 
 ## Running the tests
 

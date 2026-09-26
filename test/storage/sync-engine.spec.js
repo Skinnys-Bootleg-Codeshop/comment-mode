@@ -2,8 +2,12 @@
 // offline queueing and reconnect: a save that fails while "offline" is
 // retried and eventually delivered once the plug-in starts succeeding again,
 // triggered by a synthetic 'online' event and by a synthetic visibility
-// change. Also covers mergeComments' newest-updatedAt-wins behaviour, which
-// the sync engine relies on during its init-time reconciliation.
+// change. Also covers: a stale successful save must never erase pending
+// state set by a newer failed one; a failed initial sync must trigger a full
+// resync (not just a save retry) on the next retry trigger; a subscribe
+// push is merged the same way a sync load is; and mergeComments' newest-
+// updatedAt-wins behaviour (timestamps as instants, not raw strings, and an
+// incoming record winning an exact tie).
 'use strict';
 
 var test = require('node:test');
@@ -67,6 +71,62 @@ function createFlakyPlugin() {
   };
 }
 
+// A plug-in whose save() never resolves on its own: each call is captured so
+// the test can resolve/reject it whenever it likes, to reproduce a slow
+// save racing against a faster one.
+function createControllablePlugin() {
+  var calls = [];
+  return {
+    calls: calls,
+    load: function () { return Promise.resolve([]); },
+    save: function (pageReference, comments) {
+      var resolveFn, rejectFn;
+      var promise = new Promise(function (resolve, reject) {
+        resolveFn = resolve;
+        rejectFn = reject;
+      });
+      calls.push({ comments: comments, resolve: resolveFn, reject: rejectFn });
+      return promise;
+    }
+  };
+}
+
+// A plug-in whose load() fails while "offline" (so sync() must set
+// needsSync) and whose load()/save() both succeed once "online", recording
+// how many times each was called.
+function createLoadFlakyPlugin(remoteComments) {
+  var online = false;
+  var loadCalls = 0;
+  var saveCalls = [];
+  return {
+    setOnline: function (value) { online = value; },
+    loadCallCount: function () { return loadCalls; },
+    saveCalls: saveCalls,
+    load: function () {
+      loadCalls += 1;
+      if (!online) return Promise.reject(new Error('offline'));
+      return Promise.resolve(remoteComments);
+    },
+    save: function (pageReference, comments) {
+      saveCalls.push(comments);
+      return online ? Promise.resolve() : Promise.reject(new Error('offline'));
+    }
+  };
+}
+
+// Waits several microtask/macrotask turns, for asserting on the far end of a
+// promise chain with more than one hop (e.g. load -> merge -> save) that a
+// synthetic event handler kicked off without exposing its own promise.
+function tick(times) {
+  var p = Promise.resolve();
+  for (var i = 0; i < (times || 1); i++) {
+    p = p.then(function () {
+      return new Promise(function (resolve) { setImmediate(resolve); });
+    });
+  }
+  return p;
+}
+
 test.describe('mergeComments', function () {
   test.it('newest updatedAt wins per id', function () {
     var local = [{ id: '1', text: 'old', updatedAt: '2024-01-01T00:00:00.000Z' }];
@@ -87,6 +147,24 @@ test.describe('mergeComments', function () {
     var local = [{ id: '1', text: 'mine', createdAt: '2024-01-01T00:00:00.000Z' }];
     var merged = mergeComments(local, []);
     assert.deepEqual(merged, local);
+  });
+
+  test.it('compares timestamps as instants, not raw strings', function () {
+    // 02:00 UTC and 01:00-05:00 name the same instant in different string
+    // encodings; a raw string comparison would rank the +05:00 form as
+    // "smaller" and lose here even though the two are equal, or worse, could
+    // rank an offset-encoded newer instant behind a UTC-encoded older one.
+    var local = [{ id: '1', text: 'utc', updatedAt: '2024-01-02T02:00:00.000Z' }];
+    var remote = [{ id: '1', text: 'offset-equivalent', updatedAt: '2024-01-02T07:00:00.000+05:00' }];
+    var merged = mergeComments(local, remote);
+    assert.equal(merged[0].text, 'offset-equivalent'); // equal instant: incoming wins the tie
+  });
+
+  test.it('an exact tie is won by the incoming (remote) record', function () {
+    var local = [{ id: '1', text: 'local', updatedAt: '2024-01-01T00:00:00.000Z' }];
+    var remote = [{ id: '1', text: 'remote', updatedAt: '2024-01-01T00:00:00.000Z' }];
+    var merged = mergeComments(local, remote);
+    assert.equal(merged[0].text, 'remote');
   });
 });
 
@@ -161,5 +239,86 @@ test.describe('sync engine offline queueing and reconnect', function () {
     await engine.save(comments);
     assert.equal(engine.isPending(), false);
     assert.equal(plugin.delivered.length, 1);
+  });
+
+  test.it('a stale successful save never erases pending set by a newer failed save', async function () {
+    var plugin = createControllablePlugin();
+    var comments = [];
+
+    var engine = createSyncEngine({
+      plugin: plugin,
+      pageReference: { id: 'page' },
+      getComments: function () { return comments; },
+      setComments: function (next) { comments = next; }
+    });
+
+    // Version 1: an older mutation's save, left hanging (simulates "slow").
+    var firstSave = engine.save([{ id: '1' }]);
+    // Version 2: a newer mutation's save, which fails fast ("offline").
+    var secondSave = engine.save([{ id: '1' }, { id: '2' }]);
+    // attemptSave defers the actual plugin.save() call by a microtask, so
+    // plugin.calls isn't populated synchronously after engine.save() returns.
+    await tick();
+    plugin.calls[1].reject(new Error('offline'));
+    await secondSave;
+    assert.equal(engine.isPending(), true);
+
+    // The stale version-1 save now succeeds, after the newer one already
+    // failed. A shared boolean pending flag would clear here and version 2's
+    // failure would never be retried; version-tracking must not let that
+    // happen.
+    plugin.calls[0].resolve();
+    await firstSave;
+    assert.equal(engine.isPending(), true);
+  });
+
+  test.it('a failed initial sync triggers a full resync, not just a save retry, on reconnect', async function () {
+    var remoteComments = [{ id: 'remote-1', text: 'from the plug-in', updatedAt: '2024-01-01T00:00:00.000Z' }];
+    var plugin = createLoadFlakyPlugin(remoteComments);
+    var eventTarget = createFakeEventTarget();
+    var comments = [];
+    var renderedWith = null;
+
+    var engine = createSyncEngine({
+      plugin: plugin,
+      pageReference: { id: 'page' },
+      getComments: function () { return comments; },
+      setComments: function (next) { comments = next; },
+      onChange: function (next) { renderedWith = next; },
+      eventTarget: eventTarget
+    });
+
+    await engine.sync(); // load fails while offline: needsSync, not just pending-for-save
+    assert.equal(engine.isPending(), true);
+    assert.equal(plugin.loadCallCount(), 1);
+    assert.equal(plugin.saveCalls.length, 0);
+
+    plugin.setOnline(true);
+    eventTarget.fire('online');
+    await tick(4); // load -> merge -> save is a longer chain than a bare save retry
+
+    assert.equal(plugin.loadCallCount(), 2); // the retry re-ran the full load, not just a save
+    assert.equal(engine.isPending(), false);
+    assert.deepEqual(comments, remoteComments);
+    assert.deepEqual(renderedWith, remoteComments);
+  });
+
+  test.it('receiveChange merges a subscribe push using the same newest-updatedAt-wins rule', function () {
+    var comments = [{ id: '1', text: 'old', updatedAt: '2024-01-01T00:00:00.000Z' }];
+    var renderedWith = null;
+    var noopPlugin = { load: function () { return Promise.resolve([]); }, save: function () { return Promise.resolve(); } };
+
+    var engine = createSyncEngine({
+      plugin: noopPlugin,
+      pageReference: { id: 'page' },
+      getComments: function () { return comments; },
+      setComments: function (next) { comments = next; },
+      onChange: function (next) { renderedWith = next; }
+    });
+
+    engine.receiveChange([{ id: '1', text: 'new from another reader', updatedAt: '2024-01-02T00:00:00.000Z' }]);
+
+    assert.equal(comments[0].text, 'new from another reader');
+    assert.deepEqual(renderedWith, comments);
   });
 });
