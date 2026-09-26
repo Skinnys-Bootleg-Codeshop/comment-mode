@@ -183,19 +183,82 @@ Response, `200 OK`:
 { "success": true }
 ```
 
-A comment object carries at least `id` and a timestamp; the fuller shape
-(forward-looking, not all of it produced by today's UI yet) is `id`,
-`pageReference`, `anchor`, `sentiment`, `text`, `author`, `createdAt`,
-`updatedAt`, `status`, `deleted`, `replies`. A plug-in only ever loads or
-saves by the parent comment's `id`; `replies` travel inside the parent
-record.
+A comment object carries at least `id` and a timestamp. The full shape
+comment-mode.js itself actually produces is:
 
-**What the server behind this endpoint must do.** A POST's `comments` array
-is comment mode's current local knowledge, not a full replacement of what
-the server holds: the server must upsert by `id` into its own store, never
-delete or drop an id merely because a POST's array doesn't mention it (only
-an explicit `deleted: true` record removes a comment from view), and resolve
-each `id` by the same rule as comment mode itself: newest `updatedAt` wins
+- `id`: a string, unique within the page reference.
+- `anchor`: where the comment is on the page. See "The anchor shape" below.
+- `sentiment`: one of `'positive'`, `'neutral'` or `'negative'`.
+- `text`: the comment's own text.
+- `createdAt`: when the comment was made, UTC ISO-8601 (see "Timestamps"
+  above).
+- `author`: present only when the host supplied one at `init` time (see
+  "Using it" above); a snapshot taken at creation, `{ name, id }` with `id`
+  optional.
+- `meta`: present only when the host supplied one at `init` time; whatever
+  shape the host gave it, stamped on the same way as `author`.
+- `updatedAt`: added the moment a comment is first edited, re-anchored,
+  replied to, resolved, reopened or deleted; absent on a comment nothing has
+  touched since creation (see "Conflicts" above for how a merge falls back
+  to `createdAt` when it's missing).
+- `resolved`: added, set to `true`, the moment a comment is first resolved;
+  reopening it sets it back to `false` rather than removing it. A comment
+  that has never been resolved has no `resolved` field at all, not
+  `resolved: false`. (`resolved`, not `status`, is the actual field name;
+  CONTEXT.md's "Resolved" entry uses the same term.)
+- `deleted`: added, set to `true`, the moment a comment is deleted. There is
+  no corresponding `false` value written anywhere; an undeleted comment
+  simply has no `deleted` field.
+- `replies`: an array, added the moment the first reply is written. Each
+  reply is `{ id, text, createdAt, author }`, `author` present only when the
+  session that wrote it had one, the same snapshot rule as a comment's own
+  `author`.
+
+`pageReference` is not stored on the comment object itself: comment-mode.js
+already scopes storage by page reference (see "Storage plug-ins" above), so
+nothing in it reads a `pageReference` back off a comment. A plug-in or
+server is free to add one to its own stored copy, and `test/contract-suite.js`'s
+own fixture comments do, but it plays no part in the contract itself.
+
+A plug-in only ever loads or saves by the parent comment's `id`; `replies`
+travel inside the parent record.
+
+### The anchor shape
+
+An anchor is `{ quote: { exact, prefix, suffix }, scope, rel }`, plus two
+fields present only for certain anchors:
+
+- `quote.exact` is the anchored text itself; `quote.prefix` and
+  `quote.suffix` are the surrounding characters (see `CONTEXT_CHARS` in
+  comment-mode.js) that re-anchoring uses to relocate that text if the page's
+  markup changes around it.
+- `scope` is one of `word`, `sentence`, `block` or `section` (CONTEXT.md's
+  "Scope" entry).
+- `rel` is `{ x, y }`, each `0`-`1`: the tap's fractional position within its
+  resolved element's own bounding rect. It is only used for an anchor
+  located via `path` (a text-quote anchor is already positioned precisely by
+  its own re-found Range, which needs no help from `rel`), so a pin for a
+  structural anchor can still sit close to where the block was originally
+  tapped even though the element carries no text a Range could be built
+  from.
+- `near: true` marks a whitespace or gap anchor located near, rather than
+  on, real content (a tap between two elements, or on empty space). It still
+  carries the matched block's own text (or a generated description, such as
+  `[image: ...]`, when the block has none) as `quote.exact`; `near` only
+  means the tap didn't land on that text directly.
+- `path`: a CSS selector from `document.body`, present only as a structural
+  fallback for a block anchor whose content isn't literally searchable text
+  on the page, such as an image; comment-mode.js falls back to this instead
+  of an unsearchable quote in that case.
+
+### What the server behind this endpoint must do
+
+A POST's `comments` array is comment mode's current local knowledge, not a
+full replacement of what the server holds: the server must upsert by `id`
+into its own store, never delete or drop an id merely because a POST's
+array doesn't mention it (only an explicit `deleted: true` record removes a
+comment from view), and resolve each `id` by the same rule as comment mode
+itself: newest `updatedAt` wins
 (falling back to `createdAt`), timestamps parsed as UTC ISO-8601, incoming
 wins an exact tie. Timestamp comparison alone is not enough for `deleted`,
 though: it is sticky, not just newest-wins. If either the record already
@@ -217,6 +280,33 @@ page reference must never leak into another). It generates a fresh page
 reference on every run, so it's safe to run repeatedly against a real,
 persistent server. Point it at your own plug-in factory to check it against
 the same contract comment-mode's built-ins are held to.
+
+## Worked examples
+
+Comment mode is copy-first, not a package (see
+`docs/adr/0003-copy-first-not-a-package.md`): the two examples below are
+meant to be copied, not installed. Pick whichever matches your situation.
+
+- **`examples/single-file/`**: a static page, or any site with no server of
+  its own. One HTML file, opened straight from disk (`file://`, no server,
+  no build step). It uses the default `browserOnly()` plug-in, so comments
+  stay in that one browser's `localStorage` and never leave it. Copy
+  `comment-mode.js` next to your own HTML file, add the same one-line script
+  tag this example uses, and you're done.
+- **`examples/nextjs-upstash/`**: a hosted app where comments should be
+  visible to everyone who loads the page, not just the browser that wrote
+  them. A small Next.js app with one component that mounts comment mode
+  (`components/CommentModeLoader.js`) and one server API route implementing
+  the web-address endpoint above (`pages/api/comments.js`), backed by
+  Upstash Redis. Copy the whole directory into your own project, add your
+  own Upstash credentials (see its own README), and adjust the page it
+  mounts on.
+
+Both examples are covered by tests: the single-file one gets a Playwright
+smoke test (`test/examples-single-file.spec.js`, part of `npm test` above),
+and the Next.js one runs `runStorageContractSuite` against its actual
+endpoint logic with no live Upstash account needed (see its own README's
+"Running the tests"). Both run in CI (`.github/workflows/ci.yml`).
 
 ## Running the tests
 

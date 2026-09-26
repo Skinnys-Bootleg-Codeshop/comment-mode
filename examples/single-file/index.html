@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Comment mode: single-file example</title>
+<style>
+  body { font-family: sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; line-height: 1.5; }
+</style>
+</head>
+<body>
+  <h1>Comment mode: single-file example</h1>
+  <p>
+    This whole example is one HTML file. Open it directly from disk
+    (double-click it, or drag it into a browser tab) and it works: no server,
+    no build step, no dependencies beyond the browser itself.
+  </p>
+  <p id="how-it-works">
+    Everything comment mode needs is the one script tag below. Turn on
+    comment mode with the button in the corner, then tap any sentence on this
+    page to leave a comment. Comments are stored in this browser's
+    <code>localStorage</code>, so they're private to you and this machine,
+    and they'll still be here the next time you open this file.
+  </p>
+  <p id="copy-it">
+    To use this in your own project: copy <code>comment-mode.js</code> from
+    the root of this repository into your project alongside your HTML file,
+    then add the same one-line script tag this page uses below, pointing at
+    your own copy. That's the whole setup; everything else here is page
+    content.
+  </p>
+
+  <!--
+    This example lives inside the comment-mode repository, so it references
+    the repository's own comment-mode.js two directories up rather than
+    keeping a second copy that could drift out of sync. A copy of this
+    example taken out of the repo (per docs/adr/0003-copy-first-not-a-package.md,
+    "copy first, not a package") would instead have its own local copy of
+    comment-mode.js sitting right next to it, and this src would just be
+    "comment-mode.js".
+
+    Comment mode never infers what page it's on (see the repository README,
+    "Using it"), so pageReference is passed directly to init() here rather
+    than relying on a <head> meta tag, which would need a second tag on top
+    of this one.
+  -->
+  <script src="../../comment-mode.js" onload="CommentMode.init({pageReference:{id:'single-file-example'}})"></script>
+</body>
+</html>
