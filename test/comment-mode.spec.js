@@ -408,3 +408,239 @@ test.describe('malformed stored comments', () => {
     expect(pinCount).toBe(1);
   });
 });
+
+test.describe('sentiment', () => {
+  test('a comment saved without picking a sentiment defaults to neutral', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+
+    await page.locator('textarea').fill('Defaults to neutral.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].sentiment).toBe('neutral');
+  });
+
+  test('picking a sentiment saves it on the comment', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+
+    await page.getByRole('button', { name: 'Negative', exact: true }).tap();
+    await page.locator('textarea').fill('This part is wrong.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].sentiment).toBe('negative');
+  });
+});
+
+test.describe('author and metadata', () => {
+  test('author and meta configured at init are stamped on a new comment', async ({ page }) => {
+    await page.goto('/test/fixtures/page-author-meta.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+
+    await page.locator('textarea').fill('Needs another pass.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:author-meta-fixture'))
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].author).toEqual({ name: 'Ada Lovelace', id: 'user-42' });
+    expect(stored[0].meta).toEqual({ team: 'design', ticket: 'FOR-441' });
+  });
+
+  test('a comment created with no author or meta configured stores neither field', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+
+    await page.locator('textarea').fill('No author configured on this page.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].author).toBeUndefined();
+    expect(stored[0].meta).toBeUndefined();
+  });
+
+  test('a comment keeps the author/meta snapshot from its own creation, even after the host mutates its config object', async ({ page }) => {
+    await page.goto('/test/fixtures/page-author-meta.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    let box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('First comment.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    // The host mutates the very config object it passed to init(), in
+    // place, the way a real host's own state might change after init.
+    await page.evaluate(() => {
+      window.cmConfig.author.name = 'Ada';
+      window.cmConfig.meta.ticket = 'FOR-999';
+    });
+
+    box = await page.locator('#secondary').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('Second comment.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:author-meta-fixture'))
+    );
+    expect(stored).toHaveLength(2);
+    // Comment one keeps the snapshot taken when it was created, unaffected
+    // by the host's later mutation of its own config object.
+    expect(stored[0].author).toEqual({ name: 'Ada Lovelace', id: 'user-42' });
+    expect(stored[0].meta).toEqual({ team: 'design', ticket: 'FOR-441' });
+    // Comment two, created after the mutation, picks up the new values.
+    expect(stored[1].author).toEqual({ name: 'Ada', id: 'user-42' });
+    expect(stored[1].meta).toEqual({ team: 'design', ticket: 'FOR-999' });
+  });
+});
+
+test.describe('editing a comment', () => {
+  test('reopening a pin lets the text and sentiment change, updating updatedAt', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+
+    await page.locator('textarea').fill('Original text.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    // Exit comment mode first: reopening an existing comment to edit it must
+    // not require placement mode to still be active.
+    await page.getByRole('button', { name: 'Exit comment mode', exact: true }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await expect(page.locator('textarea')).toHaveValue('Original text.');
+
+    await page.locator('textarea').fill('Revised text.');
+    await page.getByRole('button', { name: 'Positive', exact: true }).tap();
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await expect(page.locator('textarea')).toHaveCount(0);
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].text).toBe('Revised text.');
+    expect(stored[0].sentiment).toBe('positive');
+    expect(stored[0].updatedAt).toBeTruthy();
+    expect(new Date(stored[0].updatedAt).getTime()).toBeGreaterThanOrEqual(
+      new Date(stored[0].createdAt).getTime()
+    );
+  });
+
+  test('an edited comment is still there, with its edits, after a reload', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('Before edit.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.locator('textarea').fill('After edit.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.reload();
+
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(1);
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].text).toBe('After edit.');
+  });
+
+  test('saving without changing text or sentiment does not bump updatedAt', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('Unchanged text.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    let stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored[0].updatedAt).toBeUndefined();
+
+    // Reopen and save again without touching text or sentiment.
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await expect(page.locator('textarea')).toHaveValue('Unchanged text.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+    await expect(page.locator('textarea')).toHaveCount(0);
+
+    stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].text).toBe('Unchanged text.');
+    expect(stored[0].updatedAt).toBeUndefined();
+  });
+});
+
+test.describe('deleting a comment', () => {
+  test('deleting a comment hides its pin immediately and keeps the record after reload', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('Delete me.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(1);
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByRole('button', { name: 'Delete' }).tap();
+
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(0);
+
+    let stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].deleted).toBe(true);
+    expect(stored[0].updatedAt).toBeTruthy();
+
+    await page.reload();
+
+    await expect(page.locator('[data-comment-mode-host]').locator('.cm-pin')).toHaveCount(0);
+    stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:fixture-page'))
+    );
+    // The delete is a marker on the kept record, never a removal from
+    // storage, so the array still has exactly this one (now-deleted) entry.
+    expect(stored).toHaveLength(1);
+    expect(stored[0].deleted).toBe(true);
+    expect(stored[0].text).toBe('Delete me.');
+  });
+});
