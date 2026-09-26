@@ -1692,3 +1692,360 @@ test.describe('re-anchoring, orphans and re-pin', () => {
     expect(Math.abs(result.highlights[0].left - result.paragraphRect.left)).toBeGreaterThan(20);
   });
 });
+
+test.describe('deleted comments', () => {
+  // A deleted comment stays in storage as a tombstone (`deleted: true`), so
+  // it syncs like any other edit, but it must never render a pin.
+  test('a comment marked deleted does not render a pin', async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem(
+        'comment-mode:comments:fixture-page',
+        JSON.stringify([
+          {
+            id: 'removed',
+            anchor: {
+              quote: {
+                exact: 'This is the first sentence of the introduction.',
+                prefix: '',
+                suffix: ''
+              }
+            },
+            text: 'this was retracted',
+            deleted: true,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          },
+          {
+            id: 'kept',
+            anchor: {
+              quote: {
+                exact: 'This is the second sentence of the introduction.',
+                prefix: '',
+                suffix: ''
+              }
+            },
+            text: 'still visible',
+            createdAt: new Date().toISOString()
+          }
+        ])
+      );
+    });
+
+    await page.goto('/');
+
+    await expect(page.getByRole('button', { name: 'Comment mode', exact: true })).toBeVisible();
+    const pinCount = await page.evaluate(() => {
+      const host = document.querySelector('[data-comment-mode-host]');
+      return host.shadowRoot.querySelectorAll('.cm-pin').length;
+    });
+    expect(pinCount).toBe(1);
+  });
+});
+
+test.describe('storage plug-in subscribe wiring', () => {
+  // Regression test (FOR-444 review item 4): init() must actually call
+  // plugin.subscribe, not just document that it will. The fixture's plug-in
+  // stashes the onChange callback it's given on window so this test can
+  // drive it directly, standing in for a real plug-in pushing a remote
+  // change.
+  test('a push through plugin.subscribe renders a pin, and a later delete removes it', async ({ page }) => {
+    await page.goto('/test/fixtures/page-subscribe-plugin.html');
+    await expect(page.getByRole('button', { name: 'Comment mode', exact: true })).toBeVisible();
+
+    const subscribed = await page.evaluate(() => typeof window.subscribeOnChange === 'function');
+    expect(subscribed).toBe(true);
+
+    const pinCount = () =>
+      page.evaluate(() => {
+        const host = document.querySelector('[data-comment-mode-host]');
+        return host.shadowRoot.querySelectorAll('.cm-pin').length;
+      });
+
+    await page.evaluate(() => {
+      window.subscribeOnChange([
+        {
+          id: 'pushed',
+          anchor: {
+            quote: {
+              exact: 'This is the first sentence of the introduction.',
+              prefix: '',
+              suffix: ''
+            }
+          },
+          text: 'from another reader',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        }
+      ]);
+    });
+
+    await expect.poll(pinCount).toBe(1);
+
+    await page.evaluate(() => {
+      window.subscribeOnChange([
+        {
+          id: 'pushed',
+          anchor: {
+            quote: {
+              exact: 'This is the first sentence of the introduction.',
+              prefix: '',
+              suffix: ''
+            }
+          },
+          text: 'from another reader',
+          deleted: true,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date(Date.now() + 1000).toISOString()
+        }
+      ]);
+    });
+
+    await expect.poll(pinCount).toBe(0);
+  });
+});
+
+test.describe('mutations sync to the storage plug-in', () => {
+  // Regression test (FOR-444 review item 2): the delete handler used to
+  // mark the record and write to localStorage but never call into the sync
+  // engine, so a delete never reached the plug-in until some unrelated sync
+  // happened to run. Delete must go through the same browser-first-then-sync
+  // path create/edit do. Resolve/reopen and reply (FOR-442, added after this
+  // ticket's sync engine existed) had the identical gap, fixed the same way.
+  test('deleting a comment reaches the plug-in save with deleted: true', async ({ page }) => {
+    await page.goto('/test/fixtures/page-recording-plugin.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('Delete me via plug-in.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByRole('button', { name: 'Delete' }).tap();
+
+    const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
+    expect(lastSave).toHaveLength(1);
+    expect(lastSave[0].deleted).toBe(true);
+  });
+
+  // Resolve/reopen and reply have the same shape of bug: FOR-442 added them
+  // after this ticket's sync engine existed, mutating the comment and
+  // writing to localStorage without ever calling into it.
+  test('resolving a comment reaches the plug-in save with resolved: true', async ({ page }) => {
+    await page.goto('/test/fixtures/page-recording-plugin.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('Resolve me via plug-in.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByRole('button', { name: 'Resolve', exact: true }).tap();
+
+    const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
+    expect(lastSave).toHaveLength(1);
+    expect(lastSave[0].resolved).toBe(true);
+  });
+
+  test('a reply reaches the plug-in save on the parent comment', async ({ page }) => {
+    await page.goto('/test/fixtures/page-recording-plugin.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('Reply to me via plug-in.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await page.getByPlaceholder('Reply…').fill('A reply that must sync.');
+    await page.getByRole('button', { name: 'Reply', exact: true }).tap();
+
+    const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
+    expect(lastSave).toHaveLength(1);
+    expect(lastSave[0].replies).toHaveLength(1);
+    expect(lastSave[0].replies[0].text).toBe('A reply that must sync.');
+  });
+});
+
+test.describe('mutations during a concurrent subscribe push', () => {
+  // Regression test (FOR-444 review item 3): the edit sheet closed over the
+  // specific comment object it opened with. A sync reconcile (here, a
+  // subscribe push) replaces `comments` with freshly merged objects, so an
+  // id that the push also reports (even alongside an unrelated new comment,
+  // since a push reports the plug-in's whole current array per the
+  // documented contract) gets a new object identity. Every mutating action
+  // on a reopened sheet (edit, delete, resolve, reply) must look the
+  // comment up by id in the current array, not mutate the now-detached
+  // captured object.
+  test('an edit made while a subscribe push lands mid-sheet still persists', async ({ page }) => {
+    await page.goto('/test/fixtures/page-recording-plugin.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('Original text.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.getByRole('button', { name: 'Exit comment mode', exact: true }).tap();
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await expect(page.getByPlaceholder('Leave a comment…')).toHaveValue('Original text.');
+
+    // While the edit sheet is open, a subscribe push arrives reporting the
+    // plug-in's current full state: a fresh (differently-identified) copy
+    // of the comment just saved, echoed back at the same updatedAt (so it
+    // wins the merge tie and replaces the local object), plus an unrelated
+    // new comment from another reader.
+    await page.evaluate(() => {
+      const pushed = JSON.parse(JSON.stringify(window.saveCalls[window.saveCalls.length - 1]));
+      pushed.push({
+        id: 'from-another-reader',
+        anchor: {
+          quote: {
+            exact: 'This is the second sentence of the introduction.',
+            prefix: '',
+            suffix: ''
+          }
+        },
+        text: 'unrelated new comment',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+      window.subscribeOnChange(pushed);
+    });
+
+    await page.getByPlaceholder('Leave a comment…').fill('Edited during a concurrent push.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+    await expect(page.locator('textarea')).toHaveCount(0);
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:recording-fixture'))
+    );
+    const edited = stored.find((c) => c.id !== 'from-another-reader');
+    expect(edited.text).toBe('Edited during a concurrent push.');
+
+    const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
+    const savedEdited = lastSave.find((c) => c.id !== 'from-another-reader');
+    expect(savedEdited.text).toBe('Edited during a concurrent push.');
+  });
+
+  // Shared setup for the delete/resolve/reply variants below: create a
+  // comment, reopen its pin, then trigger the same concurrent subscribe
+  // push (an echoed copy of the just-saved comment plus an unrelated new
+  // one) while the sheet is open. Every mutating action on the reopened
+  // sheet is exposed to the identical detachment risk edit is, so each gets
+  // the same race check: does the action land on the live record and reach
+  // the plug-in, or does it silently apply to the now-detached object the
+  // sheet opened with.
+  async function openCommentAndTriggerConcurrentPush(page, initialText) {
+    await page.goto('/test/fixtures/page-recording-plugin.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill(initialText);
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.getByRole('button', { name: 'Exit comment mode', exact: true }).tap();
+    await page.locator('[data-comment-mode-host]').locator('.cm-pin').tap();
+    await expect(page.getByPlaceholder('Leave a comment…')).toHaveValue(initialText);
+
+    await page.evaluate(() => {
+      const pushed = JSON.parse(JSON.stringify(window.saveCalls[window.saveCalls.length - 1]));
+      pushed.push({
+        id: 'from-another-reader',
+        anchor: {
+          quote: {
+            exact: 'This is the second sentence of the introduction.',
+            prefix: '',
+            suffix: ''
+          }
+        },
+        text: 'unrelated new comment',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+      window.subscribeOnChange(pushed);
+    });
+  }
+
+  test('a delete made while a subscribe push lands mid-sheet still reaches localStorage and the plug-in', async ({ page }) => {
+    await openCommentAndTriggerConcurrentPush(page, 'Delete me despite a concurrent push.');
+
+    await page.getByRole('button', { name: 'Delete' }).tap();
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:recording-fixture'))
+    );
+    const target = stored.find((c) => c.id !== 'from-another-reader');
+    expect(target.deleted).toBe(true);
+
+    const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
+    const savedTarget = lastSave.find((c) => c.id !== 'from-another-reader');
+    expect(savedTarget.deleted).toBe(true);
+  });
+
+  test('a resolve made while a subscribe push lands mid-sheet still reaches localStorage and the plug-in', async ({ page }) => {
+    await openCommentAndTriggerConcurrentPush(page, 'Resolve me despite a concurrent push.');
+
+    await page.getByRole('button', { name: 'Resolve', exact: true }).tap();
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:recording-fixture'))
+    );
+    const target = stored.find((c) => c.id !== 'from-another-reader');
+    expect(target.resolved).toBe(true);
+
+    const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
+    const savedTarget = lastSave.find((c) => c.id !== 'from-another-reader');
+    expect(savedTarget.resolved).toBe(true);
+  });
+
+  test('a reply made while a subscribe push lands mid-sheet still reaches localStorage and the plug-in', async ({ page }) => {
+    await openCommentAndTriggerConcurrentPush(page, 'Reply to me despite a concurrent push.');
+
+    await page.getByPlaceholder('Reply…').fill('A reply that must survive the race.');
+    await page.getByRole('button', { name: 'Reply', exact: true }).tap();
+
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:recording-fixture'))
+    );
+    const target = stored.find((c) => c.id !== 'from-another-reader');
+    expect(target.replies).toHaveLength(1);
+    expect(target.replies[0].text).toBe('A reply that must survive the race.');
+
+    const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
+    const savedTarget = lastSave.find((c) => c.id !== 'from-another-reader');
+    expect(savedTarget.replies).toHaveLength(1);
+    expect(savedTarget.replies[0].text).toBe('A reply that must survive the race.');
+  });
+});
+
+test.describe('a plug-in whose subscribe() throws', () => {
+  // Regression test (FOR-444 review item 7): subscribe() runs synchronously
+  // in init(), unlike load/save which run inside the sync engine's own
+  // promise chain, so a plug-in whose subscribe() throws used to take
+  // init() (and the whole module) down with it. It must degrade to no push
+  // updates instead.
+  test('the toggle still renders and a new comment still saves despite it', async ({ page }) => {
+    await page.goto('/test/fixtures/page-subscribe-throws.html');
+
+    const initError = await page.evaluate(() => window.commentModeInitError);
+    expect(initError).toBeNull();
+
+    await expect(page.getByRole('button', { name: 'Comment mode', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+    const box = await page.locator('#intro').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + 4, box.y + 4);
+    await page.locator('textarea').fill('Still works despite a broken subscribe.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await expect(page.locator('textarea')).toHaveCount(0);
+    const stored = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('comment-mode:comments:subscribe-throws-fixture'))
+    );
+    expect(stored).toHaveLength(1);
+    expect(stored[0].text).toBe('Still works despite a broken subscribe.');
+  });
+});

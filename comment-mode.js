@@ -12,18 +12,20 @@
  * Scope resolution supports word, sentence, block and section scopes (Linear
  * FOR-440), stepped through with the sheet's −/+ controls; anchors are
  * text-quote anchors (exact quote plus short prefix/suffix context, or a
- * structural CSS path for image-like blocks with no text of their own), and
- * storage is browser-only. FOR-441 added a sentiment picker, host-supplied
+ * structural CSS path for image-like blocks with no text of their own).
+ * FOR-441 added a sentiment picker, host-supplied
  * author/meta stamped onto new comments, and in-place editing and soft
  * delete from a comment's pin. FOR-442 added replies, resolve/reopen, and a
  * show-resolved switch. FOR-443 added re-anchoring on resize, rotation and a
  * host DOM re-render; a `rel` position within a structural (cssPath) anchor's
  * block, used only when its quote can't be found on the page at all; an
  * orphan panel for comments whose anchor can't be found; re-pin from that
- * panel; and a highlight of a reopened comment's actual matched range. See
- * CONTEXT.md and the ticket for what is deliberately not here yet (scope
- * resize, a storage plug-in, and any auth/permissions system beyond the
- * `author` field itself).
+ * panel; and a highlight of a reopened comment's actual matched range.
+ * FOR-444 added storage plug-ins, offline-first sync and a reusable storage
+ * contract suite (see README "Storage plug-ins" and test/contract-suite.js),
+ * so a host is no longer limited to one browser's localStorage. See
+ * CONTEXT.md and the ticket for what is deliberately not here yet (any
+ * auth/permissions system beyond the `author` field itself).
  */
 (function (global) {
   'use strict';
@@ -103,6 +105,319 @@
 
   function saveComments(storageKey, comments) {
     global.localStorage.setItem(storageKey, JSON.stringify(comments));
+  }
+
+  // ---------- storage plug-ins ----------
+  // A storage plug-in is the abstraction docs/adr/0002 promises hosts: load a
+  // page's comments, save comments by id (idempotent), and optionally
+  // subscribe to changes. See README "Storage plug-ins" for the full
+  // contract and the two built-ins below.
+  //
+  //   load(pageReference) -> Promise<Comment[]>
+  //   save(pageReference, comments) -> Promise<void>
+  //   subscribe(pageReference, onChange) -> unsubscribe()   // optional
+
+  // The browser-only plug-in is today's tracer-bullet behaviour made
+  // explicit: comment mode's own write to localStorage is the only store
+  // there is, so this plug-in never reaches anywhere else. It is the default
+  // in init() when no config.storage is supplied.
+  function browserOnlyPlugin() {
+    return {
+      load: function () {
+        return Promise.resolve([]);
+      },
+      save: function () {
+        return Promise.resolve();
+      }
+    };
+  }
+
+  // The web-address plug-in talks to one host endpoint. Request/response
+  // format (also documented in README "Storage plug-ins"):
+  //
+  //   GET  <endpoint>?pageReference=<url-encoded JSON of the page reference>
+  //        -> 200 { "comments": [...] }
+  //
+  //   POST <endpoint>
+  //        body: { "pageReference": {...}, "comments": [...] }
+  //        -> 200 { "success": true }
+  //
+  // `fetch` is injectable (defaults to the global fetch) so this plug-in is
+  // testable in Node without a real network.
+  function webAddressPlugin(options) {
+    options = options || {};
+    var endpoint = options.endpoint;
+    var fetchFn = options.fetch || (typeof global.fetch === 'function' ? global.fetch : undefined);
+    if (!endpoint) {
+      throw new Error('Comment mode: plugins.webAddress requires { endpoint }.');
+    }
+    if (typeof fetchFn !== 'function') {
+      throw new Error(
+        'Comment mode: plugins.webAddress found no global fetch. Pass { fetch } explicitly.'
+      );
+    }
+
+    function loadUrl(pageReference) {
+      // Deliberately not the URL API here: `new URL(endpoint)` throws
+      // synchronously on a relative endpoint (e.g. `/api/comments`, which
+      // many real hosts pass, since the comments endpoint usually lives on
+      // the same origin as the page). That throw would happen before
+      // load() even returns a promise, breaking its contract and wedging
+      // needsSync retries forever with no visible error. Appending the
+      // query string by hand, but correctly (`&` when `endpoint` already
+      // has a `?`, `?` when it doesn't), handles both absolute and relative
+      // endpoints with no base-URL fallback to get wrong.
+      var separator = endpoint.indexOf('?') === -1 ? '?' : '&';
+      return endpoint + separator + 'pageReference=' + encodeURIComponent(JSON.stringify(pageReference));
+    }
+
+    function load(pageReference) {
+      return fetchFn(loadUrl(pageReference), { method: 'GET' }).then(function (res) {
+        if (!res.ok) {
+          throw new Error('Comment mode: web-address plug-in load failed with status ' + res.status);
+        }
+        return res.json();
+      }).then(function (body) {
+        return Array.isArray(body && body.comments) ? body.comments : [];
+      });
+    }
+
+    function save(pageReference, comments) {
+      return fetchFn(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pageReference: pageReference, comments: comments })
+      }).then(function (res) {
+        if (!res.ok) {
+          throw new Error('Comment mode: web-address plug-in save failed with status ' + res.status);
+        }
+        return res.json();
+      }).then(function (body) {
+        if (!body || body.success !== true) {
+          throw new Error('Comment mode: web-address plug-in save did not report success.');
+        }
+      });
+    }
+
+    return { load: load, save: save };
+  }
+
+  // ---------- sync engine ----------
+  // A comment's sync timestamp is `updatedAt`, falling back to `createdAt`
+  // for today's tracer-bullet comments that don't have one yet. Both must be
+  // UTC ISO-8601 (`new Date().toISOString()`), the format every part of this
+  // module and its built-in plug-ins compare against. Timestamps are parsed
+  // with `Date.parse` rather than compared as raw strings, so two different
+  // string encodings of the same instant (or of unrelated formats) still
+  // compare correctly; a value that fails to parse sorts as the oldest
+  // possible instant rather than winning by accident. On an exact tie, the
+  // incoming (remote/newer-write) record wins, matching every plug-in this
+  // module ships.
+  function commentTimestamp(comment) {
+    return (comment && (comment.updatedAt || comment.createdAt)) || '';
+  }
+
+  function parseTimestamp(value) {
+    var parsed = Date.parse(value || '');
+    return isNaN(parsed) ? -Infinity : parsed;
+  }
+
+  function incomingWinsTie(incoming, existing) {
+    return parseTimestamp(commentTimestamp(incoming)) >= parseTimestamp(commentTimestamp(existing));
+  }
+
+  // Merges a local and a remote comment array by id: for every field except
+  // `deleted`, the record with the newest timestamp wins, incoming wins an
+  // exact tie (see `incomingWinsTie`). `deleted` is sticky instead: once
+  // either side has it set, the merged record keeps it, regardless of which
+  // side is newer. There is no undelete anywhere in the spec, and without
+  // this, a delete synced by one device can be silently revived by a second,
+  // offline device that never saw it and later syncs back a newer, ordinary
+  // edit to its still-live copy (FOR-438 user story 19: "an offline phone
+  // can't bring it back"). Local ordering is preserved; remote-only ids are
+  // appended at the end.
+  //
+  // A comment record must be an object with an `id` to participate in a
+  // merge at all. Storage the render path already treats defensively (see
+  // renderPin's own `!comment` check) can contain a stray `null` or an
+  // object missing `id`; without this guard, reading `.id` off such an
+  // entry throws, sync()'s catch sets needsSync, and every subsequent retry
+  // throws the same way forever, wedging sync permanently with no visible
+  // error. Skipping malformed entries here (from both local and remote,
+  // rather than keeping them in the merged/persisted result) is enough:
+  // there is nothing useful to keep from an entry with no id to merge by.
+  function isMergeableComment(value) {
+    return !!value && typeof value === 'object' && value.id !== undefined && value.id !== null;
+  }
+
+  // A shallow copy, used only to force `deleted: true` onto whichever
+  // record won the timestamp comparison, without mutating either side's own
+  // object (which the caller, or the other array being merged, may still
+  // hold a reference to).
+  function withDeletedTrue(record) {
+    var copy = {};
+    for (var key in record) {
+      if (Object.prototype.hasOwnProperty.call(record, key)) copy[key] = record[key];
+    }
+    copy.deleted = true;
+    return copy;
+  }
+
+  function mergeComments(local, remote) {
+    var localById = {};
+    (local || []).forEach(function (c) {
+      if (isMergeableComment(c)) localById[c.id] = c;
+    });
+    var remoteById = {};
+    (remote || []).forEach(function (r) {
+      if (isMergeableComment(r)) remoteById[r.id] = r;
+    });
+
+    var ids = [];
+    var seen = {};
+    (local || []).forEach(function (c) {
+      if (!isMergeableComment(c) || seen[c.id]) return;
+      ids.push(c.id);
+      seen[c.id] = true;
+    });
+    (remote || []).forEach(function (r) {
+      if (!isMergeableComment(r) || seen[r.id]) return;
+      ids.push(r.id);
+      seen[r.id] = true;
+    });
+
+    return ids.map(function (id) {
+      var localRecord = localById[id];
+      var remoteRecord = remoteById[id];
+      var winner;
+      if (localRecord && remoteRecord) {
+        winner = incomingWinsTie(remoteRecord, localRecord) ? remoteRecord : localRecord;
+      } else {
+        winner = remoteRecord || localRecord;
+      }
+      var everDeleted = !!(localRecord && localRecord.deleted) || !!(remoteRecord && remoteRecord.deleted);
+      return everDeleted && !winner.deleted ? withDeletedTrue(winner) : winner;
+    });
+  }
+
+  // Drives comment mode's offline-first sync: local storage is always
+  // written first and is never blocked on the plug-in.
+  //
+  // `sync()` runs once at init to reconcile with the plug-in's store, and
+  // again on retry after a failed load, since a load that never happened
+  // means comment mode never learned what the plug-in has. `save()` attempts
+  // to push a local mutation and quietly marks it pending on failure instead
+  // of throwing. `flush()` is the single retry entry point wired to 'online'
+  // and visibility-change triggers: it re-runs the full `sync()` if the last
+  // load failed (`needsSync`), otherwise it just retries the pending save,
+  // so a save failure never masquerades as "we know what the plug-in has"
+  // and vice versa.
+  //
+  // A shared `pending` boolean would race: a slow-but-successful save for an
+  // earlier local state could clear it right after a fast-failing save for a
+  // newer one, and the newer failure would never be retried. `version` is a
+  // monotonically increasing counter bumped on every `save()` call; a save
+  // only clears `pending` when the version it was attempting is still the
+  // current version when it resolves, so a newer failure's `pending = true`
+  // is never erased by an older save's late success.
+  function createSyncEngine(options) {
+    options = options || {};
+    var plugin = options.plugin;
+    var pageReference = options.pageReference;
+    var getComments = options.getComments;
+    var setComments = options.setComments;
+    var onChange = options.onChange;
+    var eventTarget = options.eventTarget;
+    var doc = options.document;
+
+    var version = 0;
+    var pending = false;
+    var needsSync = false;
+    var flushing = false;
+
+    function attemptSave(comments, myVersion) {
+      if (!plugin || typeof plugin.save !== 'function') return Promise.resolve();
+      return Promise.resolve()
+        .then(function () { return plugin.save(pageReference, comments); })
+        .then(function () {
+          if (myVersion === version) pending = false;
+        })
+        .catch(function () {
+          pending = true;
+        });
+    }
+
+    // Merges `remote` into local state (used by both `sync()`'s load and a
+    // plug-in's `subscribe` push) and re-renders when it actually changes
+    // anything.
+    function reconcile(remote) {
+      var local = getComments();
+      var merged = mergeComments(local, remote || []);
+      var changed = JSON.stringify(local) !== JSON.stringify(merged);
+      if (changed) {
+        setComments(merged);
+        if (onChange) onChange(merged);
+      }
+      return merged;
+    }
+
+    function save(comments) {
+      version += 1;
+      return attemptSave(comments, version);
+    }
+
+    function sync() {
+      if (!plugin || typeof plugin.load !== 'function') return Promise.resolve();
+      return Promise.resolve()
+        .then(function () { return plugin.load(pageReference); })
+        .then(function (remote) {
+          needsSync = false;
+          var merged = reconcile(remote);
+          return attemptSave(merged, version);
+        })
+        .catch(function () {
+          // Load failed (offline, network error, ...): comment mode doesn't
+          // know what the plug-in holds, so the next retry trigger must redo
+          // the whole load+merge+save, not just retry a save.
+          needsSync = true;
+        });
+    }
+
+    // A plug-in's optional push-update channel: merge what it reports by the
+    // same newest-wins rule sync() uses, without waiting for a retry trigger.
+    function receiveChange(remote) {
+      reconcile(remote);
+    }
+
+    function flush() {
+      if (flushing || (!pending && !needsSync)) return Promise.resolve();
+      flushing = true;
+      var work = needsSync ? sync() : attemptSave(getComments(), version);
+      return work.then(function () {
+        flushing = false;
+      });
+    }
+
+    function handleRetryTrigger() {
+      flush();
+    }
+
+    if (eventTarget && typeof eventTarget.addEventListener === 'function') {
+      eventTarget.addEventListener('online', handleRetryTrigger);
+    }
+    if (doc && typeof doc.addEventListener === 'function') {
+      doc.addEventListener('visibilitychange', function () {
+        if (!doc.hidden) handleRetryTrigger();
+      });
+    }
+
+    return {
+      sync: sync,
+      save: save,
+      flush: flush,
+      receiveChange: receiveChange,
+      isPending: function () { return pending || needsSync; }
+    };
   }
 
   // ---------- text index helpers ----------
@@ -1262,6 +1577,42 @@
     var pageReference = resolvePageReference(config);
     var storageKey = storageKeyFor(pageReference);
     var comments = loadComments(storageKey);
+    var plugin = (config && config.storage) || browserOnlyPlugin();
+
+    var syncEngine = createSyncEngine({
+      plugin: plugin,
+      pageReference: pageReference,
+      getComments: function () { return comments; },
+      setComments: function (next) {
+        comments = next;
+        saveComments(storageKey, comments);
+      },
+      onChange: function () { renderPins(); },
+      eventTarget: global,
+      document: typeof document !== 'undefined' ? document : undefined
+    });
+    // Reconcile with the plug-in's store asynchronously; pins already
+    // rendered from local storage are the unchanged tracer-bullet UX.
+    syncEngine.sync();
+
+    // A plug-in that supports push updates (subscribe is optional) gets its
+    // own changes merged in the same way as a sync() load, as soon as they
+    // arrive rather than waiting for the next retry trigger. Unlike
+    // load/save, which run inside the sync engine's own promise chain and so
+    // can never crash init() by throwing, subscribe() runs synchronously
+    // here: a plug-in whose subscribe() throws must not take the whole
+    // module down with it, so it's wrapped and simply degrades to no push
+    // updates.
+    if (typeof plugin.subscribe === 'function') {
+      try {
+        plugin.subscribe(pageReference, function (remoteComments) {
+          syncEngine.receiveChange(remoteComments);
+        });
+      } catch (e) {
+        // Degrade to no push updates; sync() and its retry triggers still
+        // cover this plug-in.
+      }
+    }
 
     // The host may identify who's commenting this session (a name, plus an
     // optional id) and attach its own open metadata slot; both are stamped
@@ -1366,6 +1717,7 @@
       try {
         if (
           !comment ||
+          comment.deleted ||
           !comment.anchor ||
           !comment.anchor.quote ||
           typeof comment.anchor.quote.exact !== 'string' ||
@@ -1399,6 +1751,23 @@
       }
     }
 
+    // Looks up a comment by id in the *current* `comments` array. A comment
+    // captured when a pin was rendered (and so closed over by an edit sheet
+    // or an orphan panel row) can become detached from `comments` by the
+    // time Save/Delete actually runs: a sync reconcile (init sync, retry, or
+    // a subscribe push) replaces `comments` wholesale with freshly merged
+    // objects, so the old reference is no longer part of the array that gets
+    // persisted. Falling back to the captured object only when the id can no
+    // longer be found (which shouldn't happen: merges keep every local id,
+    // only ever tombstoning) keeps a stray edit from vanishing into a
+    // detached object.
+    function findCurrentComment(id) {
+      for (var i = 0; i < comments.length; i++) {
+        if (comments[i] && comments[i].id === id) return comments[i];
+      }
+      return null;
+    }
+
     function renderOrphanPanel(orphanedComments) {
       if (!ui) return;
       ui.orphanToggle.hidden = orphanedComments.length === 0;
@@ -1428,7 +1797,11 @@
         rePinBtn.textContent = 'Re-pin';
         rePinBtn.addEventListener('click', function () {
           ui.orphanPanel.hidden = true;
-          rePinTarget = comment;
+          // The *current* record (see findCurrentComment): a sync reconcile
+          // since this panel was last rendered may have replaced `comments`
+          // with freshly merged objects, detaching `comment` from the array
+          // Save would actually persist onto.
+          rePinTarget = findCurrentComment(comment.id) || comment;
           if (!active) setActive(true);
         });
         actions.appendChild(rePinBtn);
@@ -1437,14 +1810,19 @@
         resolveBtn.type = 'button';
         resolveBtn.textContent = comment.resolved ? 'Reopen' : 'Resolve';
         resolveBtn.addEventListener('click', function () {
-          comment.resolved = !comment.resolved;
-          comment.updatedAt = new Date().toISOString();
+          var live = findCurrentComment(comment.id) || comment;
+          live.resolved = !live.resolved;
+          live.updatedAt = new Date().toISOString();
           saveComments(storageKey, comments);
+          // Browser-first, then sync: resolving from the orphan panel is a
+          // mutation like any other and must reach the plug-in the same way
+          // create/edit/delete do.
+          syncEngine.save(comments);
           // Resolving hides the comment again behind the show-resolved
           // switch (see renderPins), so a re-pin still pending for it would
           // otherwise write a fresh anchor onto a comment that stays hidden
           // regardless — surprising, so it's abandoned instead.
-          if (rePinTarget === comment) rePinTarget = null;
+          if (rePinTarget === live) rePinTarget = null;
           renderPins();
         });
         actions.appendChild(resolveBtn);
@@ -1453,14 +1831,19 @@
         delBtn.type = 'button';
         delBtn.textContent = 'Delete';
         delBtn.addEventListener('click', function () {
-          comment.deleted = true;
-          comment.updatedAt = new Date().toISOString();
+          var live = findCurrentComment(comment.id) || comment;
+          live.deleted = true;
+          live.updatedAt = new Date().toISOString();
           saveComments(storageKey, comments);
+          // Browser-first, then sync: deleting from the orphan panel is a
+          // mutation like any other and must reach the plug-in the same way
+          // create/edit/resolve do.
+          syncEngine.save(comments);
           // Without this, a re-pin still pending for a just-deleted comment
           // would write a fresh anchor and new text onto a record that never
           // renders again (deleted stays true) — the tap's comment silently
           // disappears into it (see the FOR-443 review).
-          if (rePinTarget === comment) rePinTarget = null;
+          if (rePinTarget === live) rePinTarget = null;
           renderPins();
         });
         actions.appendChild(delBtn);
@@ -1647,13 +2030,21 @@
           // button label and pin layer in place rather than rebuilding the
           // sheet (as delete's closeSheet()+renderPins() can afford to),
           // because rebuilding would throw away any text, sentiment or reply
-          // draft the sheet is still holding unsaved.
-          comment.resolved = !comment.resolved;
-          comment.updatedAt = new Date().toISOString();
+          // draft the sheet is still holding unsaved. Toggle the *current*
+          // record (see findCurrentComment), not the one captured when the
+          // sheet opened, which a sync reconcile may have since detached
+          // from `comments`.
+          var live = findCurrentComment(comment.id) || comment;
+          live.resolved = !live.resolved;
+          live.updatedAt = new Date().toISOString();
           saveComments(storageKey, comments);
+          // Browser-first, then sync: resolve/reopen is a mutation like any
+          // other and must reach the plug-in the same way create/edit/delete
+          // do.
+          syncEngine.save(comments);
           renderPins();
-          resolveBtn.textContent = comment.resolved ? 'Reopen' : 'Resolve';
-          resolvedBadge.style.display = comment.resolved ? '' : 'none';
+          resolveBtn.textContent = live.resolved ? 'Reopen' : 'Resolve';
+          resolvedBadge.style.display = live.resolved ? '' : 'none';
         });
         actions.appendChild(resolveBtn);
 
@@ -1666,10 +2057,18 @@
           // it: `comments` (and what's persisted) keeps the entry, only
           // hidden from rendering (see renderPins). That's what makes a
           // deleted comment stay gone across a reload, since the marker
-          // itself is what gets loaded back.
-          comment.deleted = true;
-          comment.updatedAt = new Date().toISOString();
+          // itself is what gets loaded back. Mutate the *current* record
+          // (see findCurrentComment), not the one captured when the sheet
+          // opened, which a sync reconcile may have since detached from
+          // `comments`.
+          var live = findCurrentComment(comment.id) || comment;
+          live.deleted = true;
+          live.updatedAt = new Date().toISOString();
           saveComments(storageKey, comments);
+          // Browser-first, then sync: a delete is a mutation like any other
+          // and must reach the plug-in the same way create/edit do, not
+          // just sit in localStorage until the next unrelated sync.
+          syncEngine.save(comments);
           closeSheet();
           renderPins();
         });
@@ -1689,23 +2088,30 @@
       save.addEventListener('click', function () {
         var text = textarea.value.trim();
         if (!text) return;
+        // Mutate the *current* record (see findCurrentComment), not the one
+        // captured when the sheet opened: a sync reconcile that ran while
+        // the sheet was open (init sync, retry, or a subscribe push) may
+        // have replaced `comments` with freshly merged objects, detaching
+        // `comment` from the array that actually gets saved.
         if (mode === 'repin') {
+          var live = findCurrentComment(comment.id) || comment;
           // The anchor always changes here (that's the point of re-pinning),
           // so unlike a plain edit this always writes, even if the text and
           // sentiment are untouched.
-          comment.anchor = pendingAnchor;
-          comment.text = text;
-          comment.sentiment = currentSentiment;
-          comment.updatedAt = new Date().toISOString();
+          live.anchor = pendingAnchor;
+          live.text = text;
+          live.sentiment = currentSentiment;
+          live.updatedAt = new Date().toISOString();
         } else if (isEdit) {
-          var changed = text !== comment.text || currentSentiment !== comment.sentiment;
+          var live = findCurrentComment(comment.id) || comment;
+          var changed = text !== live.text || currentSentiment !== live.sentiment;
           if (!changed) {
             closeSheet();
             return;
           }
-          comment.text = text;
-          comment.sentiment = currentSentiment;
-          comment.updatedAt = new Date().toISOString();
+          live.text = text;
+          live.sentiment = currentSentiment;
+          live.updatedAt = new Date().toISOString();
         } else {
           var created = {
             id: Date.now() + '-' + Math.random().toString(16).slice(2),
@@ -1723,6 +2129,7 @@
           comments.push(created);
         }
         saveComments(storageKey, comments);
+        syncEngine.save(comments);
         closeSheet();
         renderPins();
       });
@@ -1783,9 +2190,16 @@
           // handler below): the reply keeps whatever the session's author
           // was at the moment it was written.
           if (author) reply.author = JSON.parse(JSON.stringify(author));
-          comment.replies = (comment.replies || []).concat([reply]);
-          comment.updatedAt = new Date().toISOString();
+          // Append to the *current* record (see findCurrentComment), not
+          // the one captured when the sheet opened, which a sync reconcile
+          // may have since detached from `comments`.
+          var live = findCurrentComment(comment.id) || comment;
+          live.replies = (live.replies || []).concat([reply]);
+          live.updatedAt = new Date().toISOString();
           saveComments(storageKey, comments);
+          // Browser-first, then sync: a reply is a mutation like any other
+          // and must reach the plug-in the same way create/edit/delete do.
+          syncEngine.save(comments);
           // Appended in place, same reasoning as resolve/reopen above: a
           // full sheet rebuild would drop whatever the main textarea,
           // sentiment or this reply box itself still holds unsaved.
@@ -1939,5 +2353,20 @@
     };
   }
 
-  global.CommentMode = { init: init };
-})(window);
+  global.CommentMode = {
+    init: init,
+    plugins: { browserOnly: browserOnlyPlugin, webAddress: webAddressPlugin },
+    // _internal exposes the merge and sync-engine building blocks for this
+    // repo's own Node test suite to exercise without a DOM. It is not part
+    // of the documented public surface and may change without notice.
+    _internal: {
+      mergeComments: mergeComments,
+      createSyncEngine: createSyncEngine,
+      storageKeyFor: storageKeyFor
+    }
+  };
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = global.CommentMode;
+  }
+})(typeof window !== 'undefined' ? window : typeof self !== 'undefined' ? self : global);
