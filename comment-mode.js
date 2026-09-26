@@ -9,9 +9,11 @@
  * shape, and CONTEXT.md for the vocabulary used throughout (comment, anchor,
  * scope, comment mode, page reference, author).
  *
- * This is the tracer bullet (Linear FOR-439): sentence scope only, a
- * text-quote anchor (exact quote plus short prefix/suffix context), and
- * browser-only storage. See CONTEXT.md and the ticket for what is
+ * Scope resolution supports word, sentence, block and section scopes (Linear
+ * FOR-440), stepped through with the sheet's −/+ controls; anchors are
+ * text-quote anchors (exact quote plus short prefix/suffix context, or a
+ * structural CSS path for image-like blocks with no text of their own), and
+ * storage is browser-only. See CONTEXT.md and the ticket for what is
  * deliberately not here yet.
  */
 (function (global) {
@@ -121,10 +123,16 @@
   // end-of-entry check (`index <= entry.end`) already resolves an index that
   // lands on that separator to the end of the previous entry, so no other
   // offset math needs to change.
+  //
+  // A <br> inside a block is a line break, not nothing: without a separator
+  // here, `<li>Line one<br>Line two</li>` would flatten to "Line oneLine
+  // two" with the two lines glued together.
   function buildTextIndex(root) {
     var entries = [];
     var text = '';
     var previousGroup = null;
+    var blockCache = new Map();
+    var groupCache = new Map();
     var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode: function (node) {
         return isUnderSkippedAncestor(node)
@@ -136,13 +144,13 @@
     while ((node = walker.nextNode())) {
       var value = node.nodeValue;
       if (!value) continue;
-      var group = nearestGroupingAncestor(node.parentElement);
+      var group = nearestGroupingAncestor(node.parentElement, blockCache, groupCache);
+      var brBefore = previousBrSibling(node);
       if (
-        previousGroup !== null &&
-        group !== previousGroup &&
         text.length &&
         !/\s$/.test(text) &&
-        !/^\s/.test(value)
+        !/^\s/.test(value) &&
+        (brBefore || (previousGroup !== null && group !== previousGroup))
       ) {
         text += ' ';
       }
@@ -151,6 +159,19 @@
       previousGroup = group;
     }
     return { text: text, entries: entries };
+  }
+
+  // True when a <br> sits between `node` and the previous non-empty sibling
+  // content, within the same parent (a <br> at a container boundary is
+  // already covered by the grouping separator above).
+  function previousBrSibling(node) {
+    var sib = node.previousSibling;
+    while (sib) {
+      if (sib.nodeType === 1 && sib.tagName === 'BR') return true;
+      if (sib.nodeType === 3 && sib.nodeValue) return false;
+      sib = sib.previousSibling;
+    }
+    return false;
   }
 
   function indexToNodeOffset(index, entries) {
@@ -180,13 +201,38 @@
   // ---------- block detection ----------
   // Sentence/word resolution happens within the nearest block-level
   // ancestor, so a sentence never bleeds across paragraph/heading/list-item
-  // boundaries. IMG and FIGURE are here too, even though they carry no text
-  // of their own, so a tap on an image resolves directly to it (block scope)
-  // rather than falling through to a text-bearing ancestor.
+  // boundaries. IMG, FIGURE, SVG, CANVAS and VIDEO are here too, even though
+  // they carry no text of their own, so a tap on one of them resolves
+  // directly to it (block scope) rather than falling through to a
+  // text-bearing ancestor.
   var BLOCK_TAGS = [
     'P', 'LI', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'TD', 'TH', 'BLOCKQUOTE', 'PRE',
-    'IMG', 'FIGURE'
+    'IMG', 'FIGURE', 'SVG', 'CANVAS', 'VIDEO'
   ];
+
+  // Tags whose block description falls back to a bracketed placeholder
+  // (`[image: alt]`, `[svg]`, ...) because they carry no text of their own
+  // that could ever be found by a quote search. IMG's description includes
+  // its alt text; the others don't have an equivalent human-authored label.
+  var IMAGE_LIKE_LABELS = { IMG: 'image', SVG: 'svg', CANVAS: 'canvas', VIDEO: 'video' };
+
+  // Cheap, per-element block test used on the hot per-text-node ancestor
+  // walk (nearestGroupingAncestor, and any actual-text tap): a tag-name
+  // lookup or a single getComputedStyle().display read, nothing that reads
+  // `textContent` or scans descendants. `cache` is a Map scoped to one
+  // buildTextIndex/resolveTap call, so a shared ancestor visited from many
+  // different text nodes is only ever computed once.
+  function isBlockTagOrDisplay(el, cache) {
+    if (!el || el.nodeType !== 1 || isCommentModeUI(el)) return false;
+    if (cache && cache.has(el)) return cache.get(el);
+    var result = BLOCK_TAGS.indexOf(el.tagName) !== -1;
+    if (!result) {
+      var display = global.getComputedStyle(el).display;
+      result = display === 'block' || display === 'list-item' || display === 'table-cell';
+    }
+    if (cache) cache.set(el, result);
+    return result;
+  }
 
   // A generic element (a plain <div>, <main>, ...) only counts as a block
   // when it is a leaf of block-level structure with real content: a layout
@@ -200,6 +246,17 @@
   // just direct child text nodes): a <div><span>...</span></div> is a
   // perfectly ordinary block whose only child happens to be inline.
   // Elements named explicitly in BLOCK_TAGS are always block regardless.
+  //
+  // This "leaf" rule is deliberately used only for the whitespace/distance
+  // fallback path (a tap that isn't on any real text): applying it to an
+  // actual text tap regressed a real case (a <div> that contains both loose
+  // text and a nested block, e.g. `<div><strong>Note:</strong> text <p>...
+  // </p></div>`) — the div stopped counting as a block at all because it
+  // "contains" the nested <p>, so a tap on the loose text fell through to
+  // the wrong element entirely. A real text tap instead walks up to the
+  // nearest ancestor `isBlockTagOrDisplay` recognises, regardless of what
+  // else that ancestor contains — the same rule this module used before
+  // FOR-440 introduced scopes.
   function containsBlockDescendant(el) {
     var all = el.querySelectorAll('*');
     for (var i = 0; i < all.length; i++) {
@@ -211,7 +268,7 @@
     return false;
   }
 
-  function isBlockEl(el) {
+  function isBlockElLeaf(el) {
     if (!el || el.nodeType !== 1 || isCommentModeUI(el)) return false;
     if (BLOCK_TAGS.indexOf(el.tagName) !== -1) return true;
     var display = global.getComputedStyle(el).display;
@@ -222,25 +279,35 @@
     return !containsBlockDescendant(el);
   }
 
-  function findBlockAncestor(node) {
+  // `predicate` is the block test to use: `isBlockTagOrDisplay` for a tap
+  // that landed on real text (the original, non-leaf rule), or
+  // `isBlockElLeaf` for the whitespace/distance fallback path. See the
+  // comment on `containsBlockDescendant` above for why these differ.
+  function findBlockAncestor(node, predicate) {
     var el = node.nodeType === 3 ? node.parentElement : node;
     while (el && el !== document.body) {
-      if (isBlockEl(el)) return el;
+      if (predicate(el)) return el;
       el = el.parentElement;
     }
     return null;
   }
 
   // Every text node and every candidate block element is grouped under the
-  // nearest ancestor `isBlockEl` recognises (falling back to document.body),
-  // so buildTextIndex knows when it has crossed from one block-level
-  // container into another and needs to splice in a separator.
-  function nearestGroupingAncestor(el) {
-    while (el && el !== document.body) {
-      if (isBlockEl(el)) return el;
-      el = el.parentElement;
-    }
-    return document.body;
+  // nearest ancestor `isBlockTagOrDisplay` recognises (falling back to
+  // document.body), so buildTextIndex knows when it has crossed from one
+  // block-level container into another and needs to splice in a separator.
+  // `groupCache` memoizes the *result* of this walk per element (not just
+  // the per-element block test), so pages with many sibling text nodes under
+  // a shared ancestor chain resolve each ancestor's group at most once
+  // overall rather than once per text node.
+  function nearestGroupingAncestor(el, blockCache, groupCache) {
+    if (!el || el === document.body) return document.body;
+    if (groupCache && groupCache.has(el)) return groupCache.get(el);
+    var result = isBlockTagOrDisplay(el, blockCache)
+      ? el
+      : nearestGroupingAncestor(el.parentElement, blockCache, groupCache);
+    if (groupCache) groupCache.set(el, result);
+    return result;
   }
 
   function isCommentModeUI(el) {
@@ -257,7 +324,7 @@
     var bestDistance = Infinity;
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
-      if (!isBlockEl(el)) continue;
+      if (!isBlockElLeaf(el)) continue;
       var rect = el.getBoundingClientRect();
       var dx = Math.max(rect.left - clientX, 0, clientX - rect.right);
       var dy = Math.max(rect.top - clientY, 0, clientY - rect.bottom);
@@ -327,24 +394,37 @@
   // like) segment, splitting "well-known" into "well" / "-" / "known". A
   // word scope must keep a hyphenated word whole, so after finding the base
   // word-like segment at `idx`, we expand outward across any run of
-  // single-hyphen joins to word-like neighbours on either side.
+  // single-hyphen joins to word-like neighbours on either side. The ASCII
+  // hyphen-minus isn't the only character used this way in real text, so the
+  // non-breaking hyphen (U+2011) and standalone hyphen (U+2010) join too.
+  var HYPHEN_JOIN_CHARS = { '-': true, '‐': true, '‑': true };
+
+  // `idx` comes from a caret API and, like getSentenceAt, can legitimately
+  // equal `text.length` (tapping the very last character of a block reports
+  // an offset one past it). Without the same clamp-plus-adjacent-candidate
+  // handling getSentenceAt uses, that off-by-one silently fails to match any
+  // word segment and falls back to the whole block's text.
   function getWordAt(text, idx) {
     if (!text.length) return { start: 0, end: 0, text: '' };
+    var clamped = idx < 0 ? 0 : idx > text.length - 1 ? text.length - 1 : idx;
+    var candidates = clamped > 0 ? [clamped, clamped - 1] : [clamped];
 
     if (typeof Intl !== 'undefined' && Intl.Segmenter) {
       try {
         var segments = Array.from(
           new Intl.Segmenter(undefined, { granularity: 'word' }).segment(text)
         );
-        var found = -1;
-        for (var i = 0; i < segments.length; i++) {
-          var seg = segments[i];
-          if (idx >= seg.index && idx < seg.index + seg.segment.length) {
-            found = i;
-            break;
+        for (var c = 0; c < candidates.length; c++) {
+          var pos = candidates[c];
+          var found = -1;
+          for (var i = 0; i < segments.length; i++) {
+            var seg = segments[i];
+            if (pos >= seg.index && pos < seg.index + seg.segment.length) {
+              found = i;
+              break;
+            }
           }
-        }
-        if (found !== -1) {
+          if (found === -1) continue;
           if (!segments[found].isWordLike) {
             // Tapped a separator between words (e.g. the hyphen itself, or
             // punctuation/space): prefer the nearest word-like segment.
@@ -358,38 +438,40 @@
             }
             found = before !== -1 ? before : after;
           }
-          if (found !== -1) {
-            var startIdx = found;
-            var endIdx = found;
-            while (
-              startIdx > 1 &&
-              segments[startIdx - 1].segment === '-' &&
-              segments[startIdx - 2].isWordLike
-            ) {
-              startIdx -= 2;
-            }
-            while (
-              endIdx < segments.length - 2 &&
-              segments[endIdx + 1].segment === '-' &&
-              segments[endIdx + 2].isWordLike
-            ) {
-              endIdx += 2;
-            }
-            var start = segments[startIdx].index;
-            var end = segments[endIdx].index + segments[endIdx].segment.length;
-            return { start: start, end: end, text: text.slice(start, end) };
+          if (found === -1) continue;
+          var startIdx = found;
+          var endIdx = found;
+          while (
+            startIdx > 1 &&
+            HYPHEN_JOIN_CHARS[segments[startIdx - 1].segment] &&
+            segments[startIdx - 2].isWordLike
+          ) {
+            startIdx -= 2;
           }
+          while (
+            endIdx < segments.length - 2 &&
+            HYPHEN_JOIN_CHARS[segments[endIdx + 1].segment] &&
+            segments[endIdx + 2].isWordLike
+          ) {
+            endIdx += 2;
+          }
+          var start = segments[startIdx].index;
+          var end = segments[endIdx].index + segments[endIdx].segment.length;
+          return { start: start, end: end, text: text.slice(start, end) };
         }
       } catch (e) {
         // fall through to the regex fallback below
       }
     }
 
-    var re2 = /\S+/g;
-    var m;
-    while ((m = re2.exec(text))) {
-      if (idx >= m.index && idx < m.index + m[0].length) {
-        return { start: m.index, end: m.index + m[0].length, text: m[0] };
+    for (var c2 = 0; c2 < candidates.length; c2++) {
+      var pos2 = candidates[c2];
+      var re2 = /\S+/g;
+      var m;
+      while ((m = re2.exec(text))) {
+        if (pos2 >= m.index && pos2 < m.index + m[0].length) {
+          return { start: m.index, end: m.index + m[0].length, text: m[0] };
+        }
       }
     }
     return { start: 0, end: text.length, text: text };
@@ -532,7 +614,9 @@
 
     var block = null;
     if (onText) {
-      block = findBlockAncestor(textNode);
+      // Real text tap: the original, non-leaf block rule (see the comment on
+      // `containsBlockDescendant`).
+      block = findBlockAncestor(textNode, isBlockTagOrDisplay);
       if (!block) onText = false;
     }
 
@@ -546,7 +630,9 @@
           break;
         }
       }
-      block = topEl ? findBlockAncestor(topEl) : null;
+      // No real text under the tap: the stricter leaf rule, so a bare layout
+      // wrapper still defers to a real descendant block.
+      block = topEl ? findBlockAncestor(topEl, isBlockElLeaf) : null;
       if (!block) {
         block = nearestBlockByDistance(document.body, clientX, clientY);
         near = true;
@@ -661,15 +747,25 @@
         return context.block.contains(e.node);
       });
       if (!blockEntries.length) {
-        // A block with no text of its own (an image): describe it instead
-        // of anchoring to text that isn't there, and carry a CSS path to the
+        // A block with no text of its own (an image, an inline SVG/canvas/
+        // video chart, or a wrapper around one): describe it instead of
+        // anchoring to text that isn't there, and carry a CSS path to the
         // element itself, since the quote text search resolveAnchorRect and
         // locateAnchor otherwise rely on can never match a description that
         // isn't literally on the page.
-        var img = context.block.tagName === 'IMG' ? context.block : context.block.querySelector && context.block.querySelector('img');
-        var alt = img ? img.getAttribute('alt') || 'untitled' : 'untitled';
+        var imageLikeSelector = Object.keys(IMAGE_LIKE_LABELS).join(',');
+        var imageLike = IMAGE_LIKE_LABELS[context.block.tagName]
+          ? context.block
+          : context.block.querySelector && context.block.querySelector(imageLikeSelector);
+        var label = imageLike ? IMAGE_LIKE_LABELS[imageLike.tagName] : 'untitled';
+        var description =
+          imageLike && imageLike.tagName === 'IMG'
+            ? '[image: ' + (imageLike.getAttribute('alt') || 'untitled') + ']'
+            : imageLike
+            ? '[' + label + ']'
+            : '[untitled]';
         var blockAnchor = {
-          quote: { exact: '[image: ' + alt + ']', prefix: '', suffix: '' },
+          quote: { exact: description, prefix: '', suffix: '' },
           scope: 'block',
           path: cssPathFromBody(context.block)
         };
@@ -736,9 +832,12 @@
 
   // Finds the current DOM Range for a stored quote anchor. When the exact
   // quote occurs more than once on the page, the occurrence whose
-  // surrounding text best matches the stored prefix/suffix wins.
-  function locateAnchor(quote) {
-    var pageIndex = buildTextIndex(document.body);
+  // surrounding text best matches the stored prefix/suffix wins. `pageIndex`
+  // is optional — callers rendering many pins in one pass (renderPins)
+  // build it once and pass it in, rather than each pin rebuilding a
+  // whole-page index from scratch.
+  function locateAnchor(quote, pageIndex) {
+    pageIndex = pageIndex || buildTextIndex(document.body);
     var occurrences = findAllOccurrences(pageIndex.text, quote.exact);
     if (occurrences.length === 0) return null;
 
@@ -768,14 +867,23 @@
   // Range — `Range.selectNodeContents` on a childless element like <img>
   // produces a zero-size range regardless of how large the image actually
   // renders.
-  function resolveAnchorRect(anchor) {
+  //
+  // `anchor.path` is built (cssPathFromBody) as a chain of `tag:nth-of-type`
+  // steps joined by `>`, relative to document.body — but `body.querySelector`
+  // matches that selector chain anywhere in the document, not only when its
+  // first step is a direct child of body. Two images under structurally
+  // similar ancestors (e.g. both the first `div` of their respective
+  // parents) can produce the same `div:nth-of-type(1) > img:nth-of-type(1)`
+  // path and collide. `:scope > ` anchors the first step to an actual direct
+  // child of body, matching how the path was built.
+  function resolveAnchorRect(anchor, pageIndex) {
     if (anchor && anchor.quote && typeof anchor.quote.exact === 'string' && anchor.quote.exact) {
-      var range = locateAnchor(anchor.quote);
+      var range = locateAnchor(anchor.quote, pageIndex);
       if (range) return range.getBoundingClientRect();
     }
     if (anchor && anchor.path) {
       try {
-        var el = document.body.querySelector(anchor.path);
+        var el = document.body.querySelector(':scope > ' + anchor.path);
         if (el) return el.getBoundingClientRect();
       } catch (e) {
         // malformed/stale path: fall through to "not found"
@@ -953,7 +1061,7 @@
       return text.length > max ? text.slice(0, max - 1) + '…' : text;
     }
 
-    function renderPin(comment) {
+    function renderPin(comment, pageIndex) {
       // A single malformed stored comment (missing/invalid anchor, e.g. from
       // a future format or manual tampering) must not abort rendering the
       // rest, nor abort init() itself — skip it instead.
@@ -966,7 +1074,7 @@
         ) {
           return;
         }
-        var rect = resolveAnchorRect(comment.anchor);
+        var rect = resolveAnchorRect(comment.anchor, pageIndex);
         if (!rect || (rect.width === 0 && rect.height === 0)) return;
         var pin = document.createElement('div');
         pin.className = 'cm-pin';
@@ -982,7 +1090,13 @@
     function renderPins() {
       if (!ui) return;
       ui.pinsLayer.innerHTML = '';
-      comments.forEach(renderPin);
+      // Build the page-wide text index once for the whole batch of pins,
+      // rather than once per stored comment — with many comments on a large
+      // page, rebuilding it per comment was the dominant cost of a re-render.
+      var pageIndex = buildTextIndex(document.body);
+      comments.forEach(function (comment) {
+        renderPin(comment, pageIndex);
+      });
     }
 
     // `context` is what resolveTap produced (the tapped block/position and
@@ -1030,24 +1144,20 @@
         quote.textContent = text;
       }
 
-      narrow.addEventListener('click', function () {
-        if (context.levelIndex === 0) return;
-        var nextIndex = context.levelIndex - 1;
+      // Narrow (-1) and widen (+1) only ever differ in direction; both move
+      // context.levelIndex and recompute the anchor for the new scope.
+      function step(delta) {
+        var nextIndex = context.levelIndex + delta;
+        if (nextIndex < 0 || nextIndex > context.levels.length - 1) return;
         var next = computeAnchorForScope(context, context.levels[nextIndex]);
         if (!next) return;
         context.levelIndex = nextIndex;
         pendingAnchor = next;
         refresh();
-      });
-      widen.addEventListener('click', function () {
-        if (context.levelIndex === context.levels.length - 1) return;
-        var nextIndex = context.levelIndex + 1;
-        var next = computeAnchorForScope(context, context.levels[nextIndex]);
-        if (!next) return;
-        context.levelIndex = nextIndex;
-        pendingAnchor = next;
-        refresh();
-      });
+      }
+
+      narrow.addEventListener('click', function () { step(-1); });
+      widen.addEventListener('click', function () { step(1); });
 
       refresh();
 

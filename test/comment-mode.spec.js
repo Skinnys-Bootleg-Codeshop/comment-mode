@@ -501,6 +501,37 @@ test.describe('scopes', () => {
     await expect(quoteText(page)).toContainText('All of this text is inside a span.');
   });
 
+  test('a tap on loose text inside a div that also contains a nested block still anchors to that text, not the nested block', async ({ page }) => {
+    // Regression for FOR-440 review finding #2: the "leaf" block rule
+    // introduced for whitespace-tap resolution used to also apply to real
+    // text taps, so a <div> containing both loose text and a nested <p> no
+    // longer counted as a block at all (because it "contains" the nested
+    // <p>). A tap on the loose text then fell through to the whitespace
+    // fallback and mis-anchored to the unrelated nested paragraph.
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    // #loose-text-wrapper's first child is the <strong>, not a text node —
+    // the loose text " Remember this rule. " is the wrapper's *second* child
+    // node, so it can't reuse tapPointOnWord's `el.firstChild` assumption.
+    const point = await page.evaluate(() => {
+      const el = document.getElementById('loose-text-wrapper');
+      const textNode = el.childNodes[1];
+      const idx = textNode.nodeValue.indexOf('Remember');
+      const mid = idx + 4;
+      const range = document.createRange();
+      range.setStart(textNode, mid);
+      range.setEnd(textNode, mid + 1);
+      const rect = range.getBoundingClientRect();
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    });
+    await page.touchscreen.tap(point.x, point.y);
+
+    await expect(scopeLabel(page)).toHaveText('sentence');
+    await expect(quoteText(page)).toContainText('Remember this rule.');
+    await expect(quoteText(page)).not.toContainText('Other paragraph');
+  });
+
   test('a hyphenated word stays whole at word scope', async ({ page }) => {
     await page.goto('/test/fixtures/page-scopes.html');
     await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
@@ -510,7 +541,10 @@ test.describe('scopes', () => {
     await narrowButton(page).tap();
 
     await expect(scopeLabel(page)).toHaveText('word');
-    await expect(quoteText(page)).toContainText('well-known');
+    // Exact match, not toContainText: a wrong fallback to the whole sentence
+    // ("This is a well-known result worth noting.") would also contain the
+    // substring "well-known" and pass a weaker assertion.
+    await expect(quoteText(page)).toHaveText('“well-known”');
   });
 
   test('a tap in a code block resolves word scope to a single token, not the whole block', async ({ page }) => {
@@ -522,9 +556,33 @@ test.describe('scopes', () => {
     await narrowButton(page).tap();
 
     await expect(scopeLabel(page)).toHaveText('word');
-    const text = await quoteText(page).textContent();
-    expect(text).toContain('y');
-    expect(text).not.toContain('const x');
+    // Exact match: a wrong fallback to the whole block would still contain
+    // "y" (e.g. inside "const y = 2;") and pass a substring assertion.
+    await expect(quoteText(page)).toHaveText('“y”');
+  });
+
+  test('a tap on the right edge of the last character of a block still resolves the tapped word', async ({ page }) => {
+    // Regression for FOR-440 review finding #4: getWordAt didn't clamp an
+    // off-by-one caret offset (a tap on the right half of the final glyph)
+    // the way getSentenceAt already did, so it silently fell back to the
+    // whole block instead of the tapped word.
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    const point = await page.evaluate(() => {
+      const p = document.getElementById('tail-word');
+      const textNode = p.firstChild;
+      const range = document.createRange();
+      range.setStart(textNode, textNode.length - 1);
+      range.setEnd(textNode, textNode.length);
+      const rect = range.getBoundingClientRect();
+      return { x: rect.left + rect.width - 1, y: rect.top + rect.height / 2 };
+    });
+    await page.touchscreen.tap(point.x, point.y);
+    await narrowButton(page).tap();
+
+    await expect(scopeLabel(page)).toHaveText('word');
+    await expect(quoteText(page)).toHaveText('“world”');
   });
 
   test('a tap on an image defaults to block scope, describes the image, and cannot narrow further', async ({ page }) => {
@@ -567,6 +625,7 @@ test.describe('scopes', () => {
     await page.goto('/test/fixtures/page-scopes.html');
     await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
 
+    await page.locator('#whitespace-gap').scrollIntoViewIfNeeded();
     const box = await page.locator('#whitespace-gap').boundingBox();
     if (!box) throw new Error('missing bounding box');
     await page.touchscreen.tap(box.x + box.width / 2, box.y + 5);
@@ -604,5 +663,160 @@ test.describe('scopes', () => {
     expect(text).not.toContain('itemSecond');
     // The next section's heading and content must not have leaked in.
     expect(text).not.toContain('Visuals');
+  });
+
+  test('block scope on a table cell resolves to just that cell, not the whole row or table', async ({ page }) => {
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    const point = await tapPointOnWord(page, 'cell-a', 'Alpha');
+    await page.touchscreen.tap(point.x, point.y);
+    await widenButton(page).tap(); // sentence -> block
+
+    await expect(scopeLabel(page)).toHaveText('block');
+    await expect(quoteText(page)).toHaveText('“Alpha”');
+  });
+
+  test('default scope is sentence, and sentence/word scope both resolve correctly, for a tap inside a list item', async ({ page }) => {
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    const point = await tapPointOnWord(page, 'item-a', 'First');
+    await page.touchscreen.tap(point.x, point.y);
+
+    await expect(scopeLabel(page)).toHaveText('sentence');
+    await expect(quoteText(page)).toHaveText('“First item”');
+
+    await narrowButton(page).tap();
+    await expect(scopeLabel(page)).toHaveText('word');
+    await expect(quoteText(page)).toHaveText('“First”');
+  });
+
+  test('default scope is sentence, and sentence/word scope both resolve correctly, for a tap inside a table cell', async ({ page }) => {
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    const point = await tapPointOnWord(page, 'cell-a', 'Alpha');
+    await page.touchscreen.tap(point.x, point.y);
+
+    await expect(scopeLabel(page)).toHaveText('sentence');
+    await expect(quoteText(page)).toHaveText('“Alpha”');
+
+    await narrowButton(page).tap();
+    await expect(scopeLabel(page)).toHaveText('word');
+    await expect(quoteText(page)).toHaveText('“Alpha”');
+  });
+
+  test('a whitespace ("near") pin is positioned over its resolved block, not just present, after reload', async ({ page }) => {
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    await page.locator('#whitespace-gap').scrollIntoViewIfNeeded();
+    const gapBox = await page.locator('#whitespace-gap').boundingBox();
+    if (!gapBox) throw new Error('missing bounding box');
+    await page.touchscreen.tap(gapBox.x + gapBox.width / 2, gapBox.y + 5);
+    await page.locator('textarea').fill('Nearest block, not exact.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    async function pinOverTarget() {
+      return page.evaluate(() => {
+        const host = document.querySelector('[data-comment-mode-host]');
+        const pin = host.shadowRoot.querySelector('.cm-pin');
+        const target = document.getElementById('before-gap');
+        const targetRect = target.getBoundingClientRect();
+        return {
+          pin: pin ? { left: parseFloat(pin.style.left), top: parseFloat(pin.style.top) } : null,
+          target: { left: targetRect.left + window.scrollX, top: targetRect.top + window.scrollY }
+        };
+      });
+    }
+
+    const before = await pinOverTarget();
+    expect(before.pin).not.toBeNull();
+    expect(Math.abs(before.pin.left - before.target.left)).toBeLessThanOrEqual(5);
+    expect(Math.abs(before.pin.top - before.target.top)).toBeLessThanOrEqual(5);
+
+    await page.reload();
+
+    const after = await pinOverTarget();
+    expect(after.pin).not.toBeNull();
+    expect(Math.abs(after.pin.left - after.target.left)).toBeLessThanOrEqual(5);
+    expect(Math.abs(after.pin.top - after.target.top)).toBeLessThanOrEqual(5);
+  });
+
+  test('an image pin is positioned over its image, not just present, after reload', async ({ page }) => {
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    const box = await page.locator('#fixture-image').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2);
+    await page.locator('textarea').fill('Nice mockup.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    async function pinOverImage() {
+      return page.evaluate(() => {
+        const host = document.querySelector('[data-comment-mode-host]');
+        const pin = host.shadowRoot.querySelector('.cm-pin');
+        const img = document.getElementById('fixture-image');
+        const imgRect = img.getBoundingClientRect();
+        return {
+          pin: pin ? { left: parseFloat(pin.style.left), top: parseFloat(pin.style.top) } : null,
+          image: { left: imgRect.left + window.scrollX, top: imgRect.top + window.scrollY }
+        };
+      });
+    }
+
+    const before = await pinOverImage();
+    expect(before.pin).not.toBeNull();
+    expect(Math.abs(before.pin.left - before.image.left)).toBeLessThanOrEqual(5);
+    expect(Math.abs(before.pin.top - before.image.top)).toBeLessThanOrEqual(5);
+
+    await page.reload();
+
+    const after = await pinOverImage();
+    expect(after.pin).not.toBeNull();
+    expect(Math.abs(after.pin.left - after.image.left)).toBeLessThanOrEqual(5);
+    expect(Math.abs(after.pin.top - after.image.top)).toBeLessThanOrEqual(5);
+  });
+
+  test('an image anchor resolves back to the correct image after reload, not a structurally similar one', async ({ page }) => {
+    // Regression for FOR-440 review finding #3: an image's stored CSS path
+    // is resolved with document.body.querySelector(path), which matches the
+    // path anywhere in the document rather than scoping it to the direct-
+    // child chain from body it was built from. #decoy-img's own local
+    // <div> > <img> pair satisfies the same relative nth-of-type pattern as
+    // #colliding-img's stored (body-relative) path and comes first in
+    // document order, so an unscoped resolution mis-locates the pin there.
+    await page.goto('/test/fixtures/page-scopes.html');
+    await page.getByRole('button', { name: 'Comment mode', exact: true }).tap();
+
+    await page.locator('#colliding-img').scrollIntoViewIfNeeded();
+    const box = await page.locator('#colliding-img').boundingBox();
+    if (!box) throw new Error('missing bounding box');
+    await page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2);
+    await page.locator('textarea').fill('This one, not the decoy.');
+    await page.getByRole('button', { name: 'Save' }).tap();
+
+    await page.reload();
+
+    const rects = await page.evaluate(() => {
+      const host = document.querySelector('[data-comment-mode-host]');
+      const pin = host.shadowRoot.querySelector('.cm-pin');
+      const target = document.getElementById('colliding-img').getBoundingClientRect();
+      const decoy = document.getElementById('decoy-img').getBoundingClientRect();
+      return {
+        pin: pin ? { left: parseFloat(pin.style.left), top: parseFloat(pin.style.top) } : null,
+        target: { left: target.left + window.scrollX, top: target.top + window.scrollY },
+        decoy: { left: decoy.left + window.scrollX, top: decoy.top + window.scrollY }
+      };
+    });
+
+    expect(rects.pin).not.toBeNull();
+    expect(Math.abs(rects.pin.left - rects.target.left)).toBeLessThanOrEqual(5);
+    expect(Math.abs(rects.pin.top - rects.target.top)).toBeLessThanOrEqual(5);
+    // Guard against a coincidental pass: the decoy must actually be
+    // elsewhere on the page, not overlapping the target.
+    expect(Math.abs(rects.target.top - rects.decoy.top)).toBeGreaterThan(10);
   });
 });
