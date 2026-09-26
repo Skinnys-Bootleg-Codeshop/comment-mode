@@ -100,6 +100,208 @@
     global.localStorage.setItem(storageKey, JSON.stringify(comments));
   }
 
+  // ---------- storage plug-ins ----------
+  // A storage plug-in is the abstraction docs/adr/0002 promises hosts: load a
+  // page's comments, save comments by id (idempotent), and optionally
+  // subscribe to changes. See README "Storage plug-ins" for the full
+  // contract and the two built-ins below.
+  //
+  //   load(pageReference) -> Promise<Comment[]>
+  //   save(pageReference, comments) -> Promise<void>
+  //   subscribe(pageReference, onChange) -> unsubscribe()   // optional
+
+  // The browser-only plug-in is today's tracer-bullet behaviour made
+  // explicit: comment mode's own write to localStorage is the only store
+  // there is, so this plug-in never reaches anywhere else. It is the default
+  // in init() when no config.storage is supplied.
+  function browserOnlyPlugin() {
+    return {
+      load: function () {
+        return Promise.resolve([]);
+      },
+      save: function () {
+        return Promise.resolve();
+      }
+    };
+  }
+
+  // The web-address plug-in talks to one host endpoint. Request/response
+  // format (also documented in README "Storage plug-ins"):
+  //
+  //   GET  <endpoint>?pageReference=<url-encoded JSON of the page reference>
+  //        -> 200 { "comments": [...] }
+  //
+  //   POST <endpoint>
+  //        body: { "pageReference": {...}, "comments": [...] }
+  //        -> 200 { "success": true }
+  //
+  // `fetch` is injectable (defaults to the global fetch) so this plug-in is
+  // testable in Node without a real network.
+  function webAddressPlugin(options) {
+    options = options || {};
+    var endpoint = options.endpoint;
+    var fetchFn = options.fetch || (typeof global.fetch === 'function' ? global.fetch : undefined);
+    if (!endpoint) {
+      throw new Error('Comment mode: plugins.webAddress requires { endpoint }.');
+    }
+    if (typeof fetchFn !== 'function') {
+      throw new Error(
+        'Comment mode: plugins.webAddress found no global fetch. Pass { fetch } explicitly.'
+      );
+    }
+
+    function load(pageReference) {
+      var url = endpoint + '?pageReference=' + encodeURIComponent(JSON.stringify(pageReference));
+      return fetchFn(url, { method: 'GET' }).then(function (res) {
+        if (!res.ok) {
+          throw new Error('Comment mode: web-address plug-in load failed with status ' + res.status);
+        }
+        return res.json();
+      }).then(function (body) {
+        return Array.isArray(body && body.comments) ? body.comments : [];
+      });
+    }
+
+    function save(pageReference, comments) {
+      return fetchFn(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pageReference: pageReference, comments: comments })
+      }).then(function (res) {
+        if (!res.ok) {
+          throw new Error('Comment mode: web-address plug-in save failed with status ' + res.status);
+        }
+        return res.json();
+      }).then(function (body) {
+        if (!body || body.success !== true) {
+          throw new Error('Comment mode: web-address plug-in save did not report success.');
+        }
+      });
+    }
+
+    return { load: load, save: save };
+  }
+
+  // ---------- sync engine ----------
+  // A comment's sync timestamp is `updatedAt`, falling back to `createdAt`
+  // for today's tracer-bullet comments that don't have one yet.
+  function commentTimestamp(comment) {
+    return (comment && (comment.updatedAt || comment.createdAt)) || '';
+  }
+
+  // Merges a local and a remote comment array by id: the record with the
+  // newest timestamp wins. A delete is just a record with `deleted: true`
+  // and a newer `updatedAt`, so it is never revived by an older record
+  // arriving later; no special-case delete logic is needed here. Local
+  // ordering is preserved; remote-only ids are appended at the end.
+  function mergeComments(local, remote) {
+    var byId = {};
+    local.forEach(function (c) { byId[c.id] = c; });
+    (remote || []).forEach(function (r) {
+      var existing = byId[r.id];
+      if (!existing || commentTimestamp(r) > commentTimestamp(existing)) {
+        byId[r.id] = r;
+      }
+    });
+    var merged = [];
+    var seen = {};
+    local.forEach(function (c) {
+      merged.push(byId[c.id]);
+      seen[c.id] = true;
+    });
+    (remote || []).forEach(function (r) {
+      if (!seen[r.id]) {
+        merged.push(byId[r.id]);
+        seen[r.id] = true;
+      }
+    });
+    return merged;
+  }
+
+  // Drives comment mode's offline-first sync: local storage is always
+  // written first and is never blocked on the plug-in. `sync()` runs once at
+  // init to reconcile with the plug-in's store; `save()` attempts to push a
+  // local mutation and quietly marks it pending on failure instead of
+  // throwing; `flush()` retries a pending save and is wired to 'online' and
+  // visibility-change triggers when those globals are available.
+  function createSyncEngine(options) {
+    options = options || {};
+    var plugin = options.plugin;
+    var pageReference = options.pageReference;
+    var getComments = options.getComments;
+    var setComments = options.setComments;
+    var onChange = options.onChange;
+    var eventTarget = options.eventTarget;
+    var doc = options.document;
+
+    var pending = false;
+    var flushing = false;
+
+    function attemptSave(comments) {
+      if (!plugin || typeof plugin.save !== 'function') return Promise.resolve();
+      return Promise.resolve()
+        .then(function () { return plugin.save(pageReference, comments); })
+        .then(function () {
+          pending = false;
+        })
+        .catch(function () {
+          pending = true;
+        });
+    }
+
+    function save(comments) {
+      return attemptSave(comments);
+    }
+
+    function flush() {
+      if (flushing || !pending) return Promise.resolve();
+      flushing = true;
+      return attemptSave(getComments()).then(function () {
+        flushing = false;
+      });
+    }
+
+    function sync() {
+      if (!plugin || typeof plugin.load !== 'function') return Promise.resolve();
+      return Promise.resolve()
+        .then(function () { return plugin.load(pageReference); })
+        .then(function (remote) {
+          var local = getComments();
+          var merged = mergeComments(local, remote || []);
+          var changed = JSON.stringify(local) !== JSON.stringify(merged);
+          if (changed) {
+            setComments(merged);
+            if (onChange) onChange(merged);
+          }
+          return attemptSave(merged);
+        })
+        .catch(function () {
+          // Load failed (offline, network error, ...): nothing to merge, so
+          // local comments stand as they are until the next retry trigger.
+        });
+    }
+
+    function handleRetryTrigger() {
+      flush();
+    }
+
+    if (eventTarget && typeof eventTarget.addEventListener === 'function') {
+      eventTarget.addEventListener('online', handleRetryTrigger);
+    }
+    if (doc && typeof doc.addEventListener === 'function') {
+      doc.addEventListener('visibilitychange', function () {
+        if (!doc.hidden) handleRetryTrigger();
+      });
+    }
+
+    return {
+      sync: sync,
+      save: save,
+      flush: flush,
+      isPending: function () { return pending; }
+    };
+  }
+
   // ---------- text index helpers ----------
   // Text nodes under these tags are never visible page content (script/style
   // source, noscript fallback markup, inert template contents), so they must
@@ -1121,6 +1323,23 @@
     var pageReference = resolvePageReference(config);
     var storageKey = storageKeyFor(pageReference);
     var comments = loadComments(storageKey);
+    var plugin = (config && config.storage) || browserOnlyPlugin();
+
+    var syncEngine = createSyncEngine({
+      plugin: plugin,
+      pageReference: pageReference,
+      getComments: function () { return comments; },
+      setComments: function (next) {
+        comments = next;
+        saveComments(storageKey, comments);
+      },
+      onChange: function () { renderPins(); },
+      eventTarget: global,
+      document: typeof document !== 'undefined' ? document : undefined
+    });
+    // Reconcile with the plug-in's store asynchronously; pins already
+    // rendered from local storage are the unchanged tracer-bullet UX.
+    syncEngine.sync();
 
     // The host may identify who's commenting this session (a name, plus an
     // optional id) and attach its own open metadata slot; both are stamped
@@ -1418,6 +1637,7 @@
           comments.push(created);
         }
         saveComments(storageKey, comments);
+        syncEngine.save(comments);
         closeSheet();
         renderPins();
       });
@@ -1578,5 +1798,20 @@
     };
   }
 
-  global.CommentMode = { init: init };
-})(window);
+  global.CommentMode = {
+    init: init,
+    plugins: { browserOnly: browserOnlyPlugin, webAddress: webAddressPlugin },
+    // _internal exposes the merge and sync-engine building blocks for this
+    // repo's own Node test suite to exercise without a DOM. It is not part
+    // of the documented public surface and may change without notice.
+    _internal: {
+      mergeComments: mergeComments,
+      createSyncEngine: createSyncEngine,
+      storageKeyFor: storageKeyFor
+    }
+  };
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = global.CommentMode;
+  }
+})(typeof window !== 'undefined' ? window : typeof self !== 'undefined' ? self : global);

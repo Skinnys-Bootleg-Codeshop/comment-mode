@@ -4,7 +4,9 @@
   "version": "0.0.0",
   "description": "Dev tooling for comment-mode's Playwright test suite. comment-mode.js itself has no runtime dependencies; see docs/adr/0003-copy-first-not-a-package.md.",
   "scripts": {
-    "test": "playwright test",
+    "test": "npm run test:browser && npm run test:node",
+    "test:browser": "playwright test",
+    "test:node": "node --test test/storage/*.spec.js",
     "serve": "node test/serve.js"
   },
   "devDependencies": {
