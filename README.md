@@ -12,9 +12,11 @@ This is the tracer bullet (Linear FOR-439): a toggle, tap-to-comment anchored
 to the sentence under the tap, browser-only storage keyed by a page reference,
 and pins that survive a reload. FOR-441 added a sentiment picker, an author
 and an open metadata slot the host can supply at init time, and editing and
-soft-deleting a comment from its pin. Scope resizing, replies, resolve/reopen
-and a storage plug-in for hosted sites are later tickets, and there is still
-no host login or permissions system: edit and delete are available on any
+soft-deleting a comment from its pin. FOR-442 added replies from any author,
+resolving and reopening a comment, and a show-resolved switch that keeps
+resolved comments hidden by default. Scope resizing and a storage plug-in for
+hosted sites are later tickets, and there is still no host login or
+permissions system: reply, resolve, edit and delete are available on any
 comment's reopened sheet.
 
 ## Using it
@@ -60,6 +62,13 @@ When a comment is edited, its `sentiment` and `text` can change and an
 never change after creation. Deleting a comment marks it `deleted` rather
 than removing it from storage, so a delete is permanent (it never comes back
 on reload) but the record itself is kept.
+
+Anyone reopening a comment's pin can reply to it: a reply is stored on the
+comment's own `replies` array, each with its `text`, `createdAt` and, when the
+session has one, the same `author` snapshot a comment takes at creation.
+Resolving a comment (and reopening it again) toggles its `resolved` flag.
+Resolved comments are hidden by default; the show-resolved switch next to the
+comment mode toggle reveals them, and resets to hidden on every page load.
 
 ## Running the tests
 
