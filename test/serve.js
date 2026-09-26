@@ -22,7 +22,13 @@ var server = http.createServer(function (req, res) {
   if (urlPath === '/') urlPath = '/test/fixtures/page.html';
   var filePath = path.join(root, urlPath);
 
-  if (!filePath.startsWith(root)) {
+  // path.join already collapses `..` segments, but startsWith(root) alone is
+  // insufficient: a sibling directory sharing root as a name prefix (e.g.
+  // root "/a/b" vs "/a/bc") would also pass a naive startsWith check.
+  // path.relative + rejecting any result that escapes upward (or is
+  // absolute, which only happens on other platforms/drives) is exact.
+  var relative = path.relative(root, filePath);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
     res.writeHead(403);
     res.end('Forbidden');
     return;
@@ -40,6 +46,8 @@ var server = http.createServer(function (req, res) {
   });
 });
 
-server.listen(port, function () {
+// Bind to localhost only: this is a dev-only tool for the test suite, not a
+// server meant to be reachable from other machines on the network.
+server.listen(port, '127.0.0.1', function () {
   console.log('comment-mode test server listening on http://localhost:' + port);
 });

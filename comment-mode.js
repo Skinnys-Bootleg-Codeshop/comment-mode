@@ -41,8 +41,22 @@
   }
 
   function resolvePageReference(config) {
-    if (config && config.pageReference && config.pageReference.id) {
-      return config.pageReference;
+    // An explicit pageReference always wins over the head meta tag, including
+    // when it is malformed: silently falling back to the head tag would mask
+    // a caller's broken intent, so a present-but-invalid pageReference throws
+    // instead of being ignored.
+    if (config && config.pageReference) {
+      var ref = config.pageReference;
+      if (typeof ref.id !== 'string' || ref.id.length === 0) {
+        throw new Error(
+          'Comment mode: config.pageReference was supplied but its id is not a non-empty ' +
+            'string (got ' +
+            JSON.stringify(ref) +
+            '). Comment mode never falls back to a <meta> tag when pageReference is ' +
+            'explicitly supplied — fix the id or omit pageReference entirely.'
+        );
+      }
+      return ref;
     }
     var fromHead = readPageReferenceFromHead();
     if (fromHead) return fromHead;
@@ -78,13 +92,34 @@
   }
 
   // ---------- text index helpers ----------
+  // Text nodes under these tags are never visible page content (script/style
+  // source, noscript fallback markup, inert template contents), so they must
+  // never end up in the flattened text used for tap resolution, sentence
+  // segmentation or anchor prefix/suffix context.
+  var SKIPPED_ANCESTOR_TAGS = { SCRIPT: true, STYLE: true, NOSCRIPT: true, TEMPLATE: true };
+
+  function isUnderSkippedAncestor(node) {
+    var el = node.parentElement;
+    while (el) {
+      if (SKIPPED_ANCESTOR_TAGS[el.tagName]) return true;
+      el = el.parentElement;
+    }
+    return false;
+  }
+
   // Flatten the text nodes under `root` into one string, remembering which
   // DOM text node backs each character range, so a plain-text offset can be
   // converted back into a DOM Range.
   function buildTextIndex(root) {
     var entries = [];
     var text = '';
-    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: function (node) {
+        return isUnderSkippedAncestor(node)
+          ? NodeFilter.FILTER_REJECT
+          : NodeFilter.FILTER_ACCEPT;
+      }
+    });
     var node;
     while ((node = walker.nextNode())) {
       var value = node.nodeValue;
@@ -212,31 +247,54 @@
     return null;
   }
 
+  function rectContainsPoint(rect, clientX, clientY, tolerance) {
+    if (rect.width === 0 && rect.height === 0) return false;
+    return (
+      clientX >= rect.left - tolerance &&
+      clientX <= rect.right + tolerance &&
+      clientY >= rect.top - tolerance &&
+      clientY <= rect.bottom + tolerance
+    );
+  }
+
+  function characterRect(node, index) {
+    var length = node.nodeValue.length;
+    if (index < 0 || index >= length) return null;
+    try {
+      var range = document.createRange();
+      range.setStart(node, index);
+      range.setEnd(node, index + 1);
+      return range.getBoundingClientRect();
+    } catch (e) {
+      return null;
+    }
+  }
+
   // A tap only counts as "on text" when the point actually falls inside the
-  // rect of the character the caret API guessed, not just near it (the
-  // caret APIs happily return the nearest text even for taps in blank
+  // rect of a real character near the caret API's guess, not just near it
+  // (the caret APIs happily return the nearest text even for taps in blank
   // margins). The whitespace/block fallback for those taps is a later
   // ticket's scope, not this one: we simply do nothing.
+  //
+  // The caret API reports `offset` based on which side of a glyph's midpoint
+  // the point falls on: a tap on the right half of a character can come back
+  // as the offset of the *next* character. Checking only the rect at
+  // `offset` therefore misses a tap that landed solidly on a real glyph, so
+  // we also check the character immediately before it (`offset - 1`) and
+  // accept whichever one actually contains the point.
   function pointIsOnCharacter(node, offset, clientX, clientY, tolerance) {
     tolerance = tolerance || 4;
-    try {
-      var length = node.nodeValue.length;
-      if (length === 0) return false;
-      var start = offset >= length ? length - 1 : offset;
-      var range = document.createRange();
-      range.setStart(node, start);
-      range.setEnd(node, start + 1);
-      var rect = range.getBoundingClientRect();
-      if (rect.width === 0 && rect.height === 0) return false;
-      return (
-        clientX >= rect.left - tolerance &&
-        clientX <= rect.right + tolerance &&
-        clientY >= rect.top - tolerance &&
-        clientY <= rect.bottom + tolerance
-      );
-    } catch (e) {
-      return false;
+    var length = node.nodeValue.length;
+    if (length === 0) return false;
+    var at = offset >= length ? length - 1 : offset;
+    var rectAt = characterRect(node, at);
+    if (rectAt && rectContainsPoint(rectAt, clientX, clientY, tolerance)) return true;
+    var before = at - 1;
+    if (before >= 0) {
+      var rectBefore = characterRect(node, before);
+      if (rectBefore && rectContainsPoint(rectBefore, clientX, clientY, tolerance)) return true;
     }
+    return false;
   }
 
   // Resolves a tap point to the sentence it lands on, and the exact quote +
@@ -471,13 +529,16 @@
     var storageKey = storageKeyFor(pageReference);
     var comments = loadComments(storageKey);
 
-    var ui = buildUI();
+    // `ui` is only built once the DOM has a <body> to append to (see the
+    // DOMContentLoaded deferral below), so init() itself never touches
+    // document.body directly.
+    var ui = null;
     var active = false;
     var sheetEl = null;
     var pendingAnchor = null;
 
     function isInsideOwnUI(target) {
-      return !!(target && target.nodeType === 1 && ui.host.contains(target));
+      return !!(ui && target && target.nodeType === 1 && ui.host.contains(target));
     }
 
     function closeSheet() {
@@ -493,19 +554,35 @@
     }
 
     function renderPin(comment) {
-      var range = locateAnchor(comment.anchor.quote);
-      if (!range) return; // re-anchoring beyond an exact-match lookup is later scope
-      var rect = range.getBoundingClientRect();
-      if (rect.width === 0 && rect.height === 0) return;
-      var pin = document.createElement('div');
-      pin.className = 'cm-pin';
-      pin.title = comment.text;
-      pin.style.left = rect.left + global.scrollX + 'px';
-      pin.style.top = rect.top + global.scrollY + 'px';
-      ui.pinsLayer.appendChild(pin);
+      // A single malformed stored comment (missing/invalid anchor, e.g. from
+      // a future format or manual tampering) must not abort rendering the
+      // rest, nor abort init() itself — skip it instead.
+      try {
+        if (
+          !comment ||
+          !comment.anchor ||
+          !comment.anchor.quote ||
+          typeof comment.anchor.quote.exact !== 'string'
+        ) {
+          return;
+        }
+        var range = locateAnchor(comment.anchor.quote);
+        if (!range) return; // re-anchoring beyond an exact-match lookup is later scope
+        var rect = range.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) return;
+        var pin = document.createElement('div');
+        pin.className = 'cm-pin';
+        pin.title = comment.text;
+        pin.style.left = rect.left + global.scrollX + 'px';
+        pin.style.top = rect.top + global.scrollY + 'px';
+        ui.pinsLayer.appendChild(pin);
+      } catch (e) {
+        // Skip this comment; other comments still render.
+      }
     }
 
     function renderPins() {
+      if (!ui) return;
       ui.pinsLayer.innerHTML = '';
       comments.forEach(renderPin);
     }
@@ -563,19 +640,18 @@
 
     function setActive(next) {
       active = next;
-      ui.toggle.classList.toggle('cm-active', active);
-      ui.toggle.textContent = active ? 'Exit comment mode' : 'Comment mode';
+      if (ui) {
+        ui.toggle.classList.toggle('cm-active', active);
+        ui.toggle.textContent = active ? 'Exit comment mode' : 'Comment mode';
+      }
       document.documentElement.classList.toggle('comment-mode-active', active);
       if (!active) closeSheet();
     }
 
-    ui.toggle.addEventListener('click', function () {
-      setActive(!active);
-    });
-
     // Blocking selection has to happen as early as pointerdown, before the
     // browser starts one; blocking navigation happens on click, since that
-    // is when a link would otherwise follow.
+    // is when a link would otherwise follow. Neither depends on `ui`
+    // existing yet, so both listeners can be attached immediately.
     document.addEventListener(
       'pointerdown',
       function (e) {
@@ -588,7 +664,7 @@
     document.addEventListener(
       'click',
       function (e) {
-        if (!active || isInsideOwnUI(e.target)) return;
+        if (!ui || !active || isInsideOwnUI(e.target)) return;
         e.preventDefault();
         e.stopPropagation();
         if (sheetEl) {
@@ -605,12 +681,30 @@
     // A single rule, scoped to when comment mode is active, so a tap cannot
     // start a text selection on the host page. This is a behavioural
     // necessity, not comment mode's own visual styling, so it is injected as
-    // a light-DOM rule rather than kept inside the Shadow DOM.
+    // a light-DOM rule rather than kept inside the Shadow DOM. document.head
+    // already exists by the time init() runs, even from a <head> inline
+    // script, so this doesn't need to be deferred.
     var behaviourStyle = document.createElement('style');
     behaviourStyle.textContent = '.comment-mode-active { -webkit-user-select: none; user-select: none; }';
     document.head.appendChild(behaviourStyle);
 
-    renderPins();
+    // buildUI() appends to document.body, which doesn't exist yet when
+    // init() is called from a <head> inline script. Defer that (and
+    // everything depending on it) until the DOM is ready, so init() never
+    // throws regardless of where it's called from.
+    function attachUI() {
+      ui = buildUI();
+      ui.toggle.addEventListener('click', function () {
+        setActive(!active);
+      });
+      renderPins();
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', attachUI);
+    } else {
+      attachUI();
+    }
 
     return {
       isActive: function () { return active; },

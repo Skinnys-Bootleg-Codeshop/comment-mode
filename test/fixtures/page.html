@@ -20,9 +20,16 @@
   button { font-family: "Comic Sans MS", cursive; color: red; border: 5px dashed lime; }
   a { color: lime; }
   /* Host's own elements, deliberately reusing comment mode's class names, to
-     prove the module's shadow styles don't leak onto them. */
-  .cm-toggle { background: purple !important; border-radius: 0 !important; }
-  .cm-quote { color: orange !important; font-size: 40px !important; }
+     prove the module's shadow styles don't leak onto them. These rules are
+     deliberately plain (no !important) for the properties comment-mode's
+     own .cm-toggle/.cm-quote elements actually set (background,
+     border-radius, color, font-size): if the shadow stylesheet ever leaked
+     into the light DOM, an !important host rule would still visually win
+     regardless of the leak, and the isolation test below would prove
+     nothing. Leaving these plain means a real leak actually changes what
+     getComputedStyle reports here. */
+  .cm-toggle { background: purple; border-radius: 0; }
+  .cm-quote { color: orange; font-size: 40px; }
 </style>
 </head>
 <body>
