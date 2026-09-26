@@ -19,5 +19,22 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm test
-        # npm test runs both the Playwright suite (test:browser, UI/anchoring)
-        # and the Node storage contract/sync-engine suite (test:node, FOR-444).
+        # npm test runs both the Playwright suite (test:browser, UI/anchoring,
+        # including the examples/single-file smoke test) and the Node storage
+        # contract/sync-engine suite (test:node, FOR-444).
+
+  nextjs-upstash-example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+        working-directory: examples/nextjs-upstash
+      - run: npm test
+        working-directory: examples/nextjs-upstash
+        # Runs the repository's storage contract suite (test/contract-suite.js)
+        # against this example's /api/comments handler, in-process, with an
+        # in-memory store standing in for the real Upstash one: no live
+        # Upstash account or credentials needed (FOR-445).
