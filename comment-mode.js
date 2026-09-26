@@ -13,10 +13,10 @@
  * text-quote anchor (exact quote plus short prefix/suffix context), and
  * browser-only storage. FOR-441 added a sentiment picker, host-supplied
  * author/meta stamped onto new comments, and in-place editing and soft
- * delete from a comment's pin. See CONTEXT.md and the ticket for what is
- * deliberately not here yet (replies, resolve/reopen, scope resize, a
- * storage plug-in, and any auth/permissions system beyond the `author`
- * field itself).
+ * delete from a comment's pin. FOR-442 added replies, resolve/reopen, and a
+ * show-resolved switch. See CONTEXT.md and the ticket for what is
+ * deliberately not here yet (scope resize, a storage plug-in, and any
+ * auth/permissions system beyond the `author` field itself).
  */
 (function (global) {
   'use strict';
@@ -519,7 +519,38 @@
     '  cursor: pointer;',
     '}',
     '.cm-save { background: #2563eb !important; color: #fff; border-color: #2563eb !important; }',
-    '.cm-delete { color: #b91c1c !important; border-color: #b91c1c !important; margin-right: auto; }'
+    '.cm-delete { color: #b91c1c !important; border-color: #b91c1c !important; margin-right: auto; }',
+    '.cm-resolve { color: #15803d !important; border-color: #15803d !important; }',
+    '.cm-resolved-badge {',
+    '  display: inline-block;',
+    '  margin: 0 0 10px;',
+    '  padding: 2px 8px;',
+    '  border-radius: 999px;',
+    '  background: #dcfce7;',
+    '  color: #15803d;',
+    '  font-size: 0.75rem;',
+    '}',
+    '.cm-replies { list-style: none; margin: 0 0 10px; padding: 0; border-top: 1px solid #eee; }',
+    '.cm-reply { padding: 8px 0; border-bottom: 1px solid #eee; }',
+    '.cm-reply-meta { font-size: 0.75rem; color: #666; margin: 0 0 4px; }',
+    '.cm-reply-text { margin: 0; white-space: pre-wrap; }',
+    '.cm-reply-form { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }',
+    '.cm-show-resolved {',
+    '  position: fixed;',
+    '  right: 16px;',
+    '  bottom: 66px;',
+    '  z-index: 2147483000;',
+    '  display: flex;',
+    '  align-items: center;',
+    '  gap: 6px;',
+    '  padding: 6px 12px;',
+    '  border-radius: 999px;',
+    '  border: 1px solid #ccc;',
+    '  background: #fff;',
+    '  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);',
+    '  font: inherit;',
+    '  font-size: 0.8rem;',
+    '}'
   ].join('\n');
 
   function buildUI() {
@@ -542,10 +573,29 @@
     toggle.textContent = 'Comment mode';
     root.appendChild(toggle);
 
+    // Resolved comments are hidden by default (see renderPins); this switch
+    // is the only way to see them, and it lives outside the comment-mode
+    // toggle's on/off state since reading resolved comments doesn't require
+    // placement mode to be active.
+    var showResolvedLabel = document.createElement('label');
+    showResolvedLabel.className = 'cm-show-resolved';
+    var showResolvedCheckbox = document.createElement('input');
+    showResolvedCheckbox.type = 'checkbox';
+    showResolvedLabel.appendChild(showResolvedCheckbox);
+    showResolvedLabel.appendChild(document.createTextNode('Show resolved'));
+    root.appendChild(showResolvedLabel);
+
     var pinsLayer = document.createElement('div');
     root.appendChild(pinsLayer);
 
-    return { host: host, shadow: shadow, root: root, toggle: toggle, pinsLayer: pinsLayer };
+    return {
+      host: host,
+      shadow: shadow,
+      root: root,
+      toggle: toggle,
+      showResolvedCheckbox: showResolvedCheckbox,
+      pinsLayer: pinsLayer
+    };
   }
 
   // ---------- module ----------
@@ -570,6 +620,7 @@
     var active = false;
     var sheetEl = null;
     var pendingAnchor = null;
+    var showResolved = false;
 
     function isInsideOwnUI(target) {
       return !!(ui && target && target.nodeType === 1 && ui.host.contains(target));
@@ -628,9 +679,12 @@
       if (!ui) return;
       ui.pinsLayer.innerHTML = '';
       // A deleted comment stays in storage (see openSheet's delete handler)
-      // but is never rendered, so it's never shown in any list either.
+      // but is never rendered, so it's never shown in any list either. A
+      // resolved comment stays too, but is only rendered when the
+      // show-resolved switch is on (see CONTEXT.md's "Resolved" entry).
       comments.forEach(function (comment) {
         if (comment && comment.deleted) return;
+        if (comment && comment.resolved && !showResolved) return;
         renderPin(comment);
       });
     }
@@ -654,6 +708,13 @@
       quote.className = 'cm-quote';
       quote.textContent = '“' + truncate(anchor.quote.exact, 160) + '”';
       sheet.appendChild(quote);
+
+      if (isEdit && comment.resolved) {
+        var resolvedBadge = document.createElement('span');
+        resolvedBadge.className = 'cm-resolved-badge';
+        resolvedBadge.textContent = 'Resolved';
+        sheet.appendChild(resolvedBadge);
+      }
 
       var currentSentiment =
         isEdit && comment.sentiment ? comment.sentiment : DEFAULT_SENTIMENT;
@@ -690,6 +751,25 @@
       actions.className = 'cm-actions';
 
       if (isEdit) {
+        var resolveBtn = document.createElement('button');
+        resolveBtn.type = 'button';
+        resolveBtn.className = 'cm-resolve';
+        resolveBtn.textContent = comment.resolved ? 'Reopen' : 'Resolve';
+        resolveBtn.addEventListener('click', function () {
+          // Resolve/reopen is a toggle on the stored record, applied
+          // immediately (not gated behind Save), so it takes effect the same
+          // way delete does: the sheet re-opens on the same comment to show
+          // the new badge and button label, and the pin layer re-renders so
+          // a freshly resolved comment's pin can disappear straight away
+          // when the show-resolved switch is off.
+          comment.resolved = !comment.resolved;
+          comment.updatedAt = new Date().toISOString();
+          saveComments(storageKey, comments);
+          renderPins();
+          openSheet('edit', { comment: comment });
+        });
+        actions.appendChild(resolveBtn);
+
         var del = document.createElement('button');
         del.type = 'button';
         del.className = 'cm-delete';
@@ -754,6 +834,62 @@
       actions.appendChild(save);
 
       sheet.appendChild(actions);
+
+      if (isEdit) {
+        // Replies only make sense on a comment that's already saved: there's
+        // nothing to reply to yet in 'create' mode.
+        var replies = comment.replies || [];
+        if (replies.length) {
+          var repliesList = document.createElement('ul');
+          repliesList.className = 'cm-replies';
+          replies.forEach(function (reply) {
+            var item = document.createElement('li');
+            item.className = 'cm-reply';
+            var meta = document.createElement('p');
+            meta.className = 'cm-reply-meta';
+            meta.textContent =
+              (reply.author && reply.author.name ? reply.author.name : 'Anonymous') +
+              ' · ' +
+              new Date(reply.createdAt).toLocaleString();
+            item.appendChild(meta);
+            var replyText = document.createElement('p');
+            replyText.className = 'cm-reply-text';
+            replyText.textContent = reply.text;
+            item.appendChild(replyText);
+            repliesList.appendChild(item);
+          });
+          sheet.appendChild(repliesList);
+        }
+
+        var replyForm = document.createElement('div');
+        replyForm.className = 'cm-reply-form';
+        var replyTextarea = document.createElement('textarea');
+        replyTextarea.className = 'cm-textarea';
+        replyTextarea.placeholder = 'Reply…';
+        replyForm.appendChild(replyTextarea);
+        var replyBtn = document.createElement('button');
+        replyBtn.type = 'button';
+        replyBtn.textContent = 'Reply';
+        replyBtn.addEventListener('click', function () {
+          var replyText = replyTextarea.value.trim();
+          if (!replyText) return;
+          var reply = {
+            id: Date.now() + '-' + Math.random().toString(16).slice(2),
+            text: replyText,
+            createdAt: new Date().toISOString()
+          };
+          // Same snapshot rule as a comment's own author/meta (see the save
+          // handler below): the reply keeps whatever the session's author
+          // was at the moment it was written.
+          if (author) reply.author = JSON.parse(JSON.stringify(author));
+          comment.replies = replies.concat([reply]);
+          saveComments(storageKey, comments);
+          openSheet('edit', { comment: comment });
+        });
+        replyForm.appendChild(replyBtn);
+        sheet.appendChild(replyForm);
+      }
+
       ui.root.appendChild(sheet);
       sheetEl = sheet;
       textarea.focus();
@@ -817,6 +953,10 @@
       ui = buildUI();
       ui.toggle.addEventListener('click', function () {
         setActive(!active);
+      });
+      ui.showResolvedCheckbox.addEventListener('change', function () {
+        showResolved = ui.showResolvedCheckbox.checked;
+        renderPins();
       });
       renderPins();
     }
