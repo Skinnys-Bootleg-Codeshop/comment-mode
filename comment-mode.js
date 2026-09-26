@@ -535,6 +535,16 @@
     '.cm-reply-meta { font-size: 0.75rem; color: #666; margin: 0 0 4px; }',
     '.cm-reply-text { margin: 0; white-space: pre-wrap; }',
     '.cm-reply-form { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }',
+    '.cm-reply-btn {',
+    '  align-self: flex-end;',
+    '  min-height: 40px;',
+    '  padding: 8px 16px;',
+    '  border-radius: 8px;',
+    '  border: 1px solid #ccc;',
+    '  background: #f3f4f6;',
+    '  font: inherit;',
+    '  cursor: pointer;',
+    '}',
     '.cm-show-resolved {',
     '  position: fixed;',
     '  right: 16px;',
@@ -709,10 +719,17 @@
       quote.textContent = '“' + truncate(anchor.quote.exact, 160) + '”';
       sheet.appendChild(quote);
 
-      if (isEdit && comment.resolved) {
-        var resolvedBadge = document.createElement('span');
+      // Created up front (hidden when not resolved) rather than only on a
+      // resolved comment, so the resolve/reopen handler below can toggle its
+      // visibility in place instead of rebuilding the sheet, which would
+      // otherwise discard whatever the sheet's own textarea/sentiment/reply
+      // draft holds unsaved.
+      var resolvedBadge = null;
+      if (isEdit) {
+        resolvedBadge = document.createElement('span');
         resolvedBadge.className = 'cm-resolved-badge';
         resolvedBadge.textContent = 'Resolved';
+        resolvedBadge.style.display = comment.resolved ? '' : 'none';
         sheet.appendChild(resolvedBadge);
       }
 
@@ -757,16 +774,17 @@
         resolveBtn.textContent = comment.resolved ? 'Reopen' : 'Resolve';
         resolveBtn.addEventListener('click', function () {
           // Resolve/reopen is a toggle on the stored record, applied
-          // immediately (not gated behind Save), so it takes effect the same
-          // way delete does: the sheet re-opens on the same comment to show
-          // the new badge and button label, and the pin layer re-renders so
-          // a freshly resolved comment's pin can disappear straight away
-          // when the show-resolved switch is off.
+          // immediately (not gated behind Save). It updates the badge,
+          // button label and pin layer in place rather than rebuilding the
+          // sheet (as delete's closeSheet()+renderPins() can afford to),
+          // because rebuilding would throw away any text, sentiment or reply
+          // draft the sheet is still holding unsaved.
           comment.resolved = !comment.resolved;
           comment.updatedAt = new Date().toISOString();
           saveComments(storageKey, comments);
           renderPins();
-          openSheet('edit', { comment: comment });
+          resolveBtn.textContent = comment.resolved ? 'Reopen' : 'Resolve';
+          resolvedBadge.style.display = comment.resolved ? '' : 'none';
         });
         actions.appendChild(resolveBtn);
 
@@ -838,26 +856,31 @@
       if (isEdit) {
         // Replies only make sense on a comment that's already saved: there's
         // nothing to reply to yet in 'create' mode.
-        var replies = comment.replies || [];
-        if (replies.length) {
-          var repliesList = document.createElement('ul');
-          repliesList.className = 'cm-replies';
-          replies.forEach(function (reply) {
-            var item = document.createElement('li');
-            item.className = 'cm-reply';
-            var meta = document.createElement('p');
-            meta.className = 'cm-reply-meta';
-            meta.textContent =
-              (reply.author && reply.author.name ? reply.author.name : 'Anonymous') +
-              ' · ' +
-              new Date(reply.createdAt).toLocaleString();
-            item.appendChild(meta);
-            var replyText = document.createElement('p');
-            replyText.className = 'cm-reply-text';
-            replyText.textContent = reply.text;
-            item.appendChild(replyText);
-            repliesList.appendChild(item);
-          });
+        function buildReplyItem(reply) {
+          var item = document.createElement('li');
+          item.className = 'cm-reply';
+          var replyMeta = document.createElement('p');
+          replyMeta.className = 'cm-reply-meta';
+          replyMeta.textContent =
+            (reply.author && reply.author.name ? reply.author.name : 'Anonymous') +
+            ' · ' +
+            new Date(reply.createdAt).toLocaleString();
+          item.appendChild(replyMeta);
+          var replyText = document.createElement('p');
+          replyText.className = 'cm-reply-text';
+          replyText.textContent = reply.text;
+          item.appendChild(replyText);
+          return item;
+        }
+
+        var repliesList = document.createElement('ul');
+        repliesList.className = 'cm-replies';
+        (comment.replies || []).forEach(function (reply) {
+          repliesList.appendChild(buildReplyItem(reply));
+        });
+        // Only in the DOM when there's at least one reply, so an unreplied
+        // comment doesn't show an empty list's border-top rule.
+        if (comment.replies && comment.replies.length) {
           sheet.appendChild(repliesList);
         }
 
@@ -869,6 +892,7 @@
         replyForm.appendChild(replyTextarea);
         var replyBtn = document.createElement('button');
         replyBtn.type = 'button';
+        replyBtn.className = 'cm-reply-btn';
         replyBtn.textContent = 'Reply';
         replyBtn.addEventListener('click', function () {
           var replyText = replyTextarea.value.trim();
@@ -882,9 +906,16 @@
           // handler below): the reply keeps whatever the session's author
           // was at the moment it was written.
           if (author) reply.author = JSON.parse(JSON.stringify(author));
-          comment.replies = replies.concat([reply]);
+          comment.replies = (comment.replies || []).concat([reply]);
+          comment.updatedAt = new Date().toISOString();
           saveComments(storageKey, comments);
-          openSheet('edit', { comment: comment });
+          // Appended in place, same reasoning as resolve/reopen above: a
+          // full sheet rebuild would drop whatever the main textarea,
+          // sentiment or this reply box itself still holds unsaved.
+          if (!repliesList.parentNode) sheet.insertBefore(repliesList, replyForm);
+          repliesList.appendChild(buildReplyItem(reply));
+          replyTextarea.value = '';
+          replyTextarea.focus();
         });
         replyForm.appendChild(replyBtn);
         sheet.appendChild(replyForm);
