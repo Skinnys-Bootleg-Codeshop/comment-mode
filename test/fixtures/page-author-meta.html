@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="comment-mode:page-id" content="author-meta-fixture">
+<title>Comment mode fixture — author and meta</title>
+</head>
+<body>
+  <main>
+    <p id="intro">This page configures an author and host metadata at init time.</p>
+  </main>
+  <script src="/comment-mode.js"></script>
+  <script>
+    window.commentModeInstance = window.CommentMode.init({
+      author: { name: 'Ada Lovelace', id: 'user-42' },
+      meta: { team: 'design', ticket: 'FOR-441' }
+    });
+  </script>
+</body>
+</html>
