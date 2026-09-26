@@ -8,16 +8,17 @@ Read `CONTEXT.md` for the vocabulary this repo uses, and `docs/adr/` for the
 decisions behind its shape: comment mode is standalone, hosts bring their own
 storage, and it ships as copyable source rather than a package.
 
-This is the tracer bullet (Linear FOR-439): a toggle, tap-to-comment anchored
-to the sentence under the tap, browser-only storage keyed by a page reference,
-and pins that survive a reload. FOR-441 added a sentiment picker, an author
-and an open metadata slot the host can supply at init time, and editing and
-soft-deleting a comment from its pin. FOR-442 added replies from any author,
-resolving and reopening a comment, and a show-resolved switch that keeps
-resolved comments hidden by default. FOR-444 added storage plug-ins and
-offline-first sync (see "Storage plug-ins" below), so a host can now sync
-comments beyond one browser. Scope resizing is still a later ticket, and
-there is still no host login or permissions system: reply, resolve, edit and
+This started as the tracer bullet (Linear FOR-439): a toggle, tap-to-comment
+anchored to the sentence under the tap, browser-only storage keyed by a page
+reference, and pins that survive a reload. FOR-440 added word, sentence,
+block and section scopes, stepped through with the sheet's −/+ controls.
+FOR-441 added a sentiment picker, an author and an open metadata slot the
+host can supply at init time, and editing and soft-deleting a comment from
+its pin. FOR-442 added replies from any author, resolving and reopening a
+comment, and a show-resolved switch that keeps resolved comments hidden by
+default. FOR-444 added storage plug-ins and offline-first sync (see "Storage
+plug-ins" below), so a host can now sync comments beyond one browser. There
+is still no host login or permissions system: reply, resolve, edit and
 delete are available on any comment's reopened sheet.
 
 ## Using it
@@ -118,10 +119,15 @@ plug-in's own upsert) resolves per comment `id`: the record with the newest
 `updatedAt` wins, falling back to `createdAt` when `updatedAt` is absent. On
 an exact tie, the incoming record wins, whether "incoming" means the
 plug-in's copy during a sync merge or the newly-saved copy during a
-plug-in's own upsert. Because conflicts resolve this way, a deleted comment
-(`deleted: true` with a newer `updatedAt`) is never revived by an older,
-non-deleted version of the same `id` arriving later, with no special-case
-delete handling needed anywhere.
+plug-in's own upsert. `deleted` is the one exception to newest-wins: once
+either side of a merge has `deleted: true`, the merged record keeps it,
+regardless of which side is newer. There is no undelete anywhere in this
+spec, so a delete made on one device must survive even a *newer*, ordinary
+edit arriving from a second device that synced before the delete and never
+saw it (for example, an offline phone that edited its own stale copy and
+only reconnects afterwards): that edit's other fields (text, sentiment,
+`updatedAt`, ...) still win by timestamp as normal, but `deleted` does not
+revert to `false`.
 
 ### Built-in plug-ins
 
@@ -191,10 +197,15 @@ delete or drop an id merely because a POST's array doesn't mention it (only
 an explicit `deleted: true` record removes a comment from view), and resolve
 each `id` by the same rule as comment mode itself: newest `updatedAt` wins
 (falling back to `createdAt`), timestamps parsed as UTC ISO-8601, incoming
-wins an exact tie. A server that instead does "last POST wins" verbatim will
-pass a naive idempotent-save check but fail newest-wins and delete-never-
-revived the first time two saves race, which is exactly what
-`test/contract-suite.js` (below) is built to catch.
+wins an exact tie. Timestamp comparison alone is not enough for `deleted`,
+though: it is sticky, not just newest-wins. If either the record already
+stored or the one just saved has `deleted: true`, the server's upserted
+result must keep `deleted: true`, even when the other one is newer (see
+"Conflicts" above). A server that instead does "last POST wins" verbatim, or
+applies newest-wins uniformly including to `deleted`, will pass a naive
+idempotent-save check but fail newest-wins or delete-never-revived the first
+time two saves race, which is exactly what `test/contract-suite.js` (below)
+is built to catch.
 
 ### Writing your own plug-in
 

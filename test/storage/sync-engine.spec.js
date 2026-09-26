@@ -169,6 +169,32 @@ test.describe('mergeComments', function () {
     assert.equal(merged[0].text, 'remote');
   });
 
+  test.it('a delete is never revived by a newer non-delete record on the other side', function () {
+    // FOR-438 user story 19: device A deletes and syncs at T1; offline
+    // device B, which never saw the delete, edits its own stale (still
+    // live) copy at T2 > T1 and later reconnects. Newest-wins alone would
+    // let B's newer, non-deleted record win outright and silently undelete
+    // the comment everywhere; `deleted` must be sticky instead of following
+    // the timestamp like every other field.
+    var local = [{ id: 'x', deleted: true, updatedAt: '2024-01-01T00:00:00.000Z' }];
+    var remote = [{ id: 'x', text: 'edited', updatedAt: '2024-01-02T00:00:00.000Z' }];
+    var merged = mergeComments(local, remote);
+    assert.equal(merged.length, 1);
+    assert.equal(merged[0].deleted, true);
+    // Every other field still follows ordinary newest-wins.
+    assert.equal(merged[0].text, 'edited');
+  });
+
+  test.it('a delete is sticky regardless of which side (local or remote) is newer', function () {
+    var localNewerButLive = [{ id: 'y', text: 'still live locally', updatedAt: '2024-01-02T00:00:00.000Z' }];
+    var remoteOlderButDeleted = [{ id: 'y', deleted: true, updatedAt: '2024-01-01T00:00:00.000Z' }];
+    var merged = mergeComments(localNewerButLive, remoteOlderButDeleted);
+    assert.equal(merged[0].deleted, true);
+    // The newer side still wins every other field, including here where the
+    // newer side happens to be the one without the delete.
+    assert.equal(merged[0].text, 'still live locally');
+  });
+
   test.it('skips a malformed entry instead of throwing, in both local and remote', function () {
     // The render path already treats stored comments defensively (renderPin
     // skips `!comment`), so a stray `null` or an id-less object is expected

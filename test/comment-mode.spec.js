@@ -1514,6 +1514,10 @@ test.describe('mutations during a concurrent subscribe push', () => {
     );
     const edited = stored.find((c) => c.id !== 'from-another-reader');
     expect(edited.text).toBe('Edited during a concurrent push.');
+
+    const lastSave = await page.evaluate(() => window.saveCalls[window.saveCalls.length - 1]);
+    const savedEdited = lastSave.find((c) => c.id !== 'from-another-reader');
+    expect(savedEdited.text).toBe('Edited during a concurrent push.');
   });
 
   // Shared setup for the delete/resolve/reply variants below: create a

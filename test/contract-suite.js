@@ -2,9 +2,11 @@
 // an implementor of their own plug-in (or their own web-address endpoint)
 // can run the same checks comment-mode itself relies on, without a browser.
 //
-// Usage:
+// Usage: comment-mode is copy-first, not an npm package (see
+// docs/adr/0003-copy-first-not-a-package.md), so copy this file into your
+// own project alongside comment-mode.js, then:
 //
-//   const { runStorageContractSuite } = require('comment-mode/test/contract-suite');
+//   const { runStorageContractSuite } = require('./contract-suite');
 //   runStorageContractSuite('my plug-in', () => createMyPlugin());
 //
 // `createPlugin` is called fresh for each test (it may return a Promise) and
@@ -103,6 +105,45 @@ function runStorageContractSuite(label, createPlugin) {
       var loaded = await plugin.load(pageReference);
       assert.equal(loaded.length, 1);
       assert.equal(loaded[0].deleted, true);
+    });
+
+    test.it('a delete is never revived by a newer edit that never saw it', async function () {
+      // FOR-438 user story 19: a delete made on one device must survive a
+      // *newer* ordinary edit from a second device that synced before the
+      // delete happened and never saw it (e.g. an offline phone editing its
+      // own stale, still-live copy and only reconnecting afterwards).
+      // Timestamp comparison alone would let the newer edit win outright and
+      // silently undelete the comment; deleted must be sticky instead.
+      var pageReference = uniquePageReference('delete-sticky-against-newer-edit');
+      var plugin = await createPlugin();
+      var live = {
+        id: 'c6',
+        text: 'original',
+        createdAt: '2024-01-01T00:00:00.000Z',
+        updatedAt: '2024-01-01T00:00:00.000Z'
+      };
+      var deletedLater = {
+        id: 'c6',
+        text: 'original',
+        deleted: true,
+        createdAt: '2024-01-01T00:00:00.000Z',
+        updatedAt: '2024-01-02T00:00:00.000Z'
+      };
+      var newerEditThatMissedTheDelete = {
+        id: 'c6',
+        text: 'edited on a device that never saw the delete',
+        createdAt: '2024-01-01T00:00:00.000Z',
+        updatedAt: '2024-01-03T00:00:00.000Z'
+      };
+      await plugin.save(pageReference, [live]);
+      await plugin.save(pageReference, [deletedLater]);
+      await plugin.save(pageReference, [newerEditThatMissedTheDelete]);
+      var loaded = await plugin.load(pageReference);
+      assert.equal(loaded.length, 1);
+      assert.equal(loaded[0].deleted, true);
+      // Every other field still follows ordinary newest-wins: only `deleted`
+      // is sticky, so the newer edit's text is not discarded either.
+      assert.equal(loaded[0].text, 'edited on a device that never saw the delete');
     });
 
     test.it('replies round-trip byte for byte', async function () {

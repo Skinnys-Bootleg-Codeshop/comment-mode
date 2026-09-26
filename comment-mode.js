@@ -221,12 +221,17 @@
     return parseTimestamp(commentTimestamp(incoming)) >= parseTimestamp(commentTimestamp(existing));
   }
 
-  // Merges a local and a remote comment array by id: the record with the
-  // newest timestamp wins, incoming wins an exact tie (see
-  // `incomingWinsTie`). A delete is just a record with `deleted: true` and a
-  // newer `updatedAt`, so it is never revived by an older record arriving
-  // later; no special-case delete logic is needed here. Local ordering is
-  // preserved; remote-only ids are appended at the end.
+  // Merges a local and a remote comment array by id: for every field except
+  // `deleted`, the record with the newest timestamp wins, incoming wins an
+  // exact tie (see `incomingWinsTie`). `deleted` is sticky instead: once
+  // either side has it set, the merged record keeps it, regardless of which
+  // side is newer. There is no undelete anywhere in the spec, and without
+  // this, a delete synced by one device can be silently revived by a second,
+  // offline device that never saw it and later syncs back a newer, ordinary
+  // edit to its still-live copy (FOR-438 user story 19: "an offline phone
+  // can't bring it back"). Local ordering is preserved; remote-only ids are
+  // appended at the end.
+  //
   // A comment record must be an object with an `id` to participate in a
   // merge at all. Storage the render path already treats defensively (see
   // renderPin's own `!comment` check) can contain a stray `null` or an
@@ -240,31 +245,54 @@
     return !!value && typeof value === 'object' && value.id !== undefined && value.id !== null;
   }
 
+  // A shallow copy, used only to force `deleted: true` onto whichever
+  // record won the timestamp comparison, without mutating either side's own
+  // object (which the caller, or the other array being merged, may still
+  // hold a reference to).
+  function withDeletedTrue(record) {
+    var copy = {};
+    for (var key in record) {
+      if (Object.prototype.hasOwnProperty.call(record, key)) copy[key] = record[key];
+    }
+    copy.deleted = true;
+    return copy;
+  }
+
   function mergeComments(local, remote) {
-    var byId = {};
-    local.forEach(function (c) {
-      if (isMergeableComment(c)) byId[c.id] = c;
+    var localById = {};
+    (local || []).forEach(function (c) {
+      if (isMergeableComment(c)) localById[c.id] = c;
     });
+    var remoteById = {};
     (remote || []).forEach(function (r) {
-      if (!isMergeableComment(r)) return;
-      var existing = byId[r.id];
-      if (!existing || incomingWinsTie(r, existing)) {
-        byId[r.id] = r;
-      }
+      if (isMergeableComment(r)) remoteById[r.id] = r;
     });
-    var merged = [];
+
+    var ids = [];
     var seen = {};
-    local.forEach(function (c) {
+    (local || []).forEach(function (c) {
       if (!isMergeableComment(c) || seen[c.id]) return;
-      merged.push(byId[c.id]);
+      ids.push(c.id);
       seen[c.id] = true;
     });
     (remote || []).forEach(function (r) {
       if (!isMergeableComment(r) || seen[r.id]) return;
-      merged.push(byId[r.id]);
+      ids.push(r.id);
       seen[r.id] = true;
     });
-    return merged;
+
+    return ids.map(function (id) {
+      var localRecord = localById[id];
+      var remoteRecord = remoteById[id];
+      var winner;
+      if (localRecord && remoteRecord) {
+        winner = incomingWinsTie(remoteRecord, localRecord) ? remoteRecord : localRecord;
+      } else {
+        winner = remoteRecord || localRecord;
+      }
+      var everDeleted = !!(localRecord && localRecord.deleted) || !!(remoteRecord && remoteRecord.deleted);
+      return everDeleted && !winner.deleted ? withDeletedTrue(winner) : winner;
+    });
   }
 
   // Drives comment mode's offline-first sync: local storage is always
