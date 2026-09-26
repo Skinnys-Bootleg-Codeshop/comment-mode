@@ -1397,11 +1397,21 @@
 
     // A plug-in that supports push updates (subscribe is optional) gets its
     // own changes merged in the same way as a sync() load, as soon as they
-    // arrive rather than waiting for the next retry trigger.
+    // arrive rather than waiting for the next retry trigger. Unlike
+    // load/save, which run inside the sync engine's own promise chain and so
+    // can never crash init() by throwing, subscribe() runs synchronously
+    // here: a plug-in whose subscribe() throws must not take the whole
+    // module down with it, so it's wrapped and simply degrades to no push
+    // updates.
     if (typeof plugin.subscribe === 'function') {
-      plugin.subscribe(pageReference, function (remoteComments) {
-        syncEngine.receiveChange(remoteComments);
-      });
+      try {
+        plugin.subscribe(pageReference, function (remoteComments) {
+          syncEngine.receiveChange(remoteComments);
+        });
+      } catch (e) {
+        // Degrade to no push updates; sync() and its retry triggers still
+        // cover this plug-in.
+      }
     }
 
     // The host may identify who's commenting this session (a name, plus an

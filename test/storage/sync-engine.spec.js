@@ -150,14 +150,16 @@ test.describe('mergeComments', function () {
   });
 
   test.it('compares timestamps as instants, not raw strings', function () {
-    // 02:00 UTC and 01:00-05:00 name the same instant in different string
-    // encodings; a raw string comparison would rank the +05:00 form as
-    // "smaller" and lose here even though the two are equal, or worse, could
-    // rank an offset-encoded newer instant behind a UTC-encoded older one.
-    var local = [{ id: '1', text: 'utc', updatedAt: '2024-01-02T02:00:00.000Z' }];
-    var remote = [{ id: '1', text: 'offset-equivalent', updatedAt: '2024-01-02T07:00:00.000+05:00' }];
+    // local is a delete at 02:00 UTC. remote is a non-deleted, chronologically
+    // OLDER record at 06:00+05:00, which is 01:00 UTC. Its string form sorts
+    // *after* local's ("...T06..." > "...T02...") even though the instant it
+    // names is earlier, so a raw string comparison would incorrectly let this
+    // older remote record win and revive the delete. Date.parse-based
+    // comparison must keep the delete.
+    var local = [{ id: '1', deleted: true, updatedAt: '2024-01-02T02:00:00.000Z' }];
+    var remote = [{ id: '1', deleted: false, updatedAt: '2024-01-02T06:00:00.000+05:00' }];
     var merged = mergeComments(local, remote);
-    assert.equal(merged[0].text, 'offset-equivalent'); // equal instant: incoming wins the tie
+    assert.equal(merged[0].deleted, true);
   });
 
   test.it('an exact tie is won by the incoming (remote) record', function () {

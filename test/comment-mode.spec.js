@@ -1332,3 +1332,65 @@ test.describe('deleted comments', () => {
     expect(pinCount).toBe(1);
   });
 });
+
+test.describe('storage plug-in subscribe wiring', () => {
+  // Regression test (FOR-444 review item 4): init() must actually call
+  // plugin.subscribe, not just document that it will. The fixture's plug-in
+  // stashes the onChange callback it's given on window so this test can
+  // drive it directly, standing in for a real plug-in pushing a remote
+  // change.
+  test('a push through plugin.subscribe renders a pin, and a later delete removes it', async ({ page }) => {
+    await page.goto('/test/fixtures/page-subscribe-plugin.html');
+    await expect(page.getByRole('button', { name: 'Comment mode', exact: true })).toBeVisible();
+
+    const subscribed = await page.evaluate(() => typeof window.subscribeOnChange === 'function');
+    expect(subscribed).toBe(true);
+
+    const pinCount = () =>
+      page.evaluate(() => {
+        const host = document.querySelector('[data-comment-mode-host]');
+        return host.shadowRoot.querySelectorAll('.cm-pin').length;
+      });
+
+    await page.evaluate(() => {
+      window.subscribeOnChange([
+        {
+          id: 'pushed',
+          anchor: {
+            quote: {
+              exact: 'This is the first sentence of the introduction.',
+              prefix: '',
+              suffix: ''
+            }
+          },
+          text: 'from another reader',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        }
+      ]);
+    });
+
+    await expect.poll(pinCount).toBe(1);
+
+    await page.evaluate(() => {
+      window.subscribeOnChange([
+        {
+          id: 'pushed',
+          anchor: {
+            quote: {
+              exact: 'This is the first sentence of the introduction.',
+              prefix: '',
+              suffix: ''
+            }
+          },
+          text: 'from another reader',
+          deleted: true,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date(Date.now() + 1000).toISOString()
+        }
+      ]);
+    });
+
+    await expect.poll(pinCount).toBe(0);
+  });
+});
