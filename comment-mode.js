@@ -13,8 +13,11 @@
  * FOR-440), stepped through with the sheet's −/+ controls; anchors are
  * text-quote anchors (exact quote plus short prefix/suffix context, or a
  * structural CSS path for image-like blocks with no text of their own), and
- * storage is browser-only. See CONTEXT.md and the ticket for what is
- * deliberately not here yet.
+ * storage is browser-only. FOR-441 added a sentiment picker, host-supplied
+ * author/meta stamped onto new comments, and in-place editing and soft
+ * delete from a comment's pin. See CONTEXT.md and the ticket for what is
+ * deliberately not here yet (replies, resolve/reopen, a storage plug-in, and
+ * any auth/permissions system beyond the `author` field itself).
  */
 (function (global) {
   'use strict';
@@ -23,6 +26,9 @@
   var META_PAGE_VERSION = 'comment-mode:page-version';
   var STORAGE_PREFIX = 'comment-mode:comments:';
   var CONTEXT_CHARS = 32;
+  var SENTIMENTS = ['positive', 'neutral', 'negative'];
+  var SENTIMENT_LABELS = { positive: 'Positive', neutral: 'Neutral', negative: 'Negative' };
+  var DEFAULT_SENTIMENT = 'neutral';
 
   // ---------- page reference ----------
   // A page reference is never inferred (never location.href): the host
@@ -944,7 +950,7 @@
     '  transform: translate(-50%, -50%);',
     '  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);',
     '  z-index: 2147482000;',
-    '  cursor: default;',
+    '  cursor: pointer;',
     '}',
     '.cm-sheet {',
     '  position: fixed;',
@@ -983,6 +989,23 @@
     '  margin: 0 0 10px;',
     '  line-height: 1.4;',
     '}',
+    '.cm-sentiment { display: flex; gap: 8px; margin: 0 0 10px; }',
+    '.cm-sentiment-btn {',
+    '  flex: 1;',
+    '  min-height: 40px;',
+    '  padding: 8px 10px;',
+    '  border-radius: 8px;',
+    '  border: 1px solid #ccc;',
+    '  background: #f3f4f6;',
+    '  font: inherit;',
+    '  color: inherit;',
+    '  cursor: pointer;',
+    '}',
+    '.cm-sentiment-btn.cm-sentiment-selected {',
+    '  background: #2563eb;',
+    '  color: #fff;',
+    '  border-color: #2563eb;',
+    '}',
     '.cm-textarea {',
     '  width: 100%;',
     '  min-height: 72px;',
@@ -1002,7 +1025,8 @@
     '  font: inherit;',
     '  cursor: pointer;',
     '}',
-    '.cm-save { background: #2563eb !important; color: #fff; border-color: #2563eb !important; }'
+    '.cm-save { background: #2563eb !important; color: #fff; border-color: #2563eb !important; }',
+    '.cm-delete { color: #b91c1c !important; border-color: #b91c1c !important; margin-right: auto; }'
   ].join('\n');
 
   function buildUI() {
@@ -1036,6 +1060,15 @@
     var pageReference = resolvePageReference(config);
     var storageKey = storageKeyFor(pageReference);
     var comments = loadComments(storageKey);
+
+    // The host may identify who's commenting this session (a name, plus an
+    // optional id) and attach its own open metadata slot; both are stamped
+    // onto every comment this session creates. Neither is validated beyond
+    // presence: comment mode has no identity or schema system of its own,
+    // the host owns the shape of both (see CONTEXT.md's "Author" entry and
+    // the FOR-438 spec's "meta" field description).
+    var author = config && config.author ? config.author : null;
+    var meta = config && Object.prototype.hasOwnProperty.call(config, 'meta') ? config.meta : undefined;
 
     // `ui` is only built once the DOM has a <body> to append to (see the
     // DOMContentLoaded deferral below), so init() itself never touches
@@ -1081,6 +1114,15 @@
         pin.title = comment.text;
         pin.style.left = rect.left + global.scrollX + 'px';
         pin.style.top = rect.top + global.scrollY + 'px';
+        // Reopening a pin is how editing/deleting an existing comment
+        // happens (see openSheet's 'edit' mode below). This isn't gated on
+        // `active`: placing a *new* comment requires comment mode to be on,
+        // but reading/editing one that's already there doesn't.
+        pin.addEventListener('click', function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          openSheet('edit', { comment: comment });
+        });
         ui.pinsLayer.appendChild(pin);
       } catch (e) {
         // Skip this comment; other comments still render.
@@ -1094,19 +1136,32 @@
       // rather than once per stored comment — with many comments on a large
       // page, rebuilding it per comment was the dominant cost of a re-render.
       var pageIndex = buildTextIndex(document.body);
+      // A deleted comment stays in storage (see openSheet's delete handler)
+      // but is never rendered, so it's never shown in any list either.
       comments.forEach(function (comment) {
+        if (comment && comment.deleted) return;
         renderPin(comment, pageIndex);
       });
     }
 
-    // `context` is what resolveTap produced (the tapped block/position and
-    // the ordered list of scopes available from here); `anchor` is the
-    // already-resolved anchor at context.levels[context.levelIndex]. The
-    // −/+ controls only ever move `context.levelIndex` and recompute the
-    // anchor for the new scope; they never re-resolve the original tap.
-    function openSheet(context, anchor) {
+    // `mode` is 'create' (placing a new comment on a freshly resolved
+    // anchor, where `data.context` is what resolveTap produced — the tapped
+    // block/position and the ordered list of scopes available from here) or
+    // 'edit' (reopened from an existing comment's pin, to change its
+    // text/sentiment or delete it). There's no `context` in edit mode, so
+    // the −/+ scope controls are disabled there: the anchor quote is always
+    // read-only display, never itself editable on an existing comment
+    // (scope resize is later ticket scope). The −/+ controls, when enabled,
+    // only ever move `context.levelIndex` and recompute the anchor for the
+    // new scope; they never re-resolve the original tap.
+    function openSheet(mode, data) {
       closeSheet();
+      var isEdit = mode === 'edit';
+      var comment = isEdit ? data.comment : null;
+      var context = isEdit ? null : data.context;
+      var anchor = isEdit ? comment.anchor : data.anchor;
       pendingAnchor = anchor;
+
       var sheet = document.createElement('div');
       sheet.className = 'cm-sheet';
 
@@ -1136,17 +1191,27 @@
       sheet.appendChild(quote);
 
       function refresh() {
-        scopeLabel.textContent = context.levels[context.levelIndex];
-        narrow.disabled = context.levelIndex === 0;
-        widen.disabled = context.levelIndex === context.levels.length - 1;
+        if (context) {
+          scopeLabel.textContent = context.levels[context.levelIndex];
+          narrow.disabled = context.levelIndex === 0;
+          widen.disabled = context.levelIndex === context.levels.length - 1;
+        } else {
+          // Edit mode has no context to step through: the scope an existing
+          // comment was created with is fixed, so just display it.
+          scopeLabel.textContent = pendingAnchor.scope || '';
+          narrow.disabled = true;
+          widen.disabled = true;
+        }
         var text = '“' + truncate(pendingAnchor.quote.exact, 160) + '”';
         if (pendingAnchor.near) text += ' (near)';
         quote.textContent = text;
       }
 
       // Narrow (-1) and widen (+1) only ever differ in direction; both move
-      // context.levelIndex and recompute the anchor for the new scope.
+      // context.levelIndex and recompute the anchor for the new scope. A
+      // no-op (no `context`, i.e. edit mode) since the buttons are disabled.
       function step(delta) {
+        if (!context) return;
         var nextIndex = context.levelIndex + delta;
         if (nextIndex < 0 || nextIndex > context.levels.length - 1) return;
         var next = computeAnchorForScope(context, context.levels[nextIndex]);
@@ -1161,13 +1226,59 @@
 
       refresh();
 
+      var currentSentiment =
+        isEdit && comment.sentiment ? comment.sentiment : DEFAULT_SENTIMENT;
+      var sentimentButtons = {};
+      var sentimentWrap = document.createElement('div');
+      sentimentWrap.className = 'cm-sentiment';
+      SENTIMENTS.forEach(function (value) {
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'cm-sentiment-btn';
+        btn.textContent = SENTIMENT_LABELS[value];
+        btn.setAttribute('aria-pressed', String(value === currentSentiment));
+        btn.classList.toggle('cm-sentiment-selected', value === currentSentiment);
+        btn.addEventListener('click', function () {
+          currentSentiment = value;
+          Object.keys(sentimentButtons).forEach(function (key) {
+            var selected = key === value;
+            sentimentButtons[key].classList.toggle('cm-sentiment-selected', selected);
+            sentimentButtons[key].setAttribute('aria-pressed', String(selected));
+          });
+        });
+        sentimentButtons[value] = btn;
+        sentimentWrap.appendChild(btn);
+      });
+      sheet.appendChild(sentimentWrap);
+
       var textarea = document.createElement('textarea');
       textarea.className = 'cm-textarea';
       textarea.placeholder = 'Leave a comment…';
+      if (isEdit) textarea.value = comment.text;
       sheet.appendChild(textarea);
 
       var actions = document.createElement('div');
       actions.className = 'cm-actions';
+
+      if (isEdit) {
+        var del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'cm-delete';
+        del.textContent = 'Delete';
+        del.addEventListener('click', function () {
+          // A delete is a marker on the stored record, never a removal from
+          // it: `comments` (and what's persisted) keeps the entry, only
+          // hidden from rendering (see renderPins). That's what makes a
+          // deleted comment stay gone across a reload, since the marker
+          // itself is what gets loaded back.
+          comment.deleted = true;
+          comment.updatedAt = new Date().toISOString();
+          saveComments(storageKey, comments);
+          closeSheet();
+          renderPins();
+        });
+        actions.appendChild(del);
+      }
 
       var cancel = document.createElement('button');
       cancel.type = 'button';
@@ -1182,13 +1293,31 @@
       save.addEventListener('click', function () {
         var text = textarea.value.trim();
         if (!text) return;
-        var comment = {
-          id: Date.now() + '-' + Math.random().toString(16).slice(2),
-          anchor: pendingAnchor,
-          text: text,
-          createdAt: new Date().toISOString()
-        };
-        comments.push(comment);
+        if (isEdit) {
+          var changed = text !== comment.text || currentSentiment !== comment.sentiment;
+          if (!changed) {
+            closeSheet();
+            return;
+          }
+          comment.text = text;
+          comment.sentiment = currentSentiment;
+          comment.updatedAt = new Date().toISOString();
+        } else {
+          var created = {
+            id: Date.now() + '-' + Math.random().toString(16).slice(2),
+            anchor: pendingAnchor,
+            text: text,
+            sentiment: currentSentiment,
+            createdAt: new Date().toISOString()
+          };
+          // Deep-copy author/meta so each comment holds an independent
+          // snapshot taken at creation time; the host may later mutate its
+          // own config object, and comments must not retroactively pick
+          // that up (see FOR-441 review).
+          if (author) created.author = JSON.parse(JSON.stringify(author));
+          if (meta !== undefined) created.meta = JSON.parse(JSON.stringify(meta));
+          comments.push(created);
+        }
         saveComments(storageKey, comments);
         closeSheet();
         renderPins();
@@ -1238,7 +1367,7 @@
         if (!context) return;
         var anchor = computeAnchorForScope(context, context.levels[context.levelIndex]);
         if (!anchor) return;
-        openSheet(context, anchor);
+        openSheet('create', { context: context, anchor: anchor });
       },
       { capture: true }
     );

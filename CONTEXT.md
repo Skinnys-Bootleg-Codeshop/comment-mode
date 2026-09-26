@@ -31,6 +31,9 @@ The site or app that embeds comment mode and decides who may comment and where c
 The person who wrote a comment, as the host identifies them. Empty when there is no host login, such as on a local file.
 _Avoid_: User, commenter
 
+**Meta**:
+An open slot for host metadata on a comment, supplied at `init` time and stamped onto every comment created that session. Comment mode never reads or interprets it; only the host gives it shape (for example `{team, role, ticket}`).
+
 **Page reference**:
 What the host says a page is: its identity (such as a URL or file path) and, if the host cares, its version or source. Comment mode never infers it; the implementor supplies it.
 _Avoid_: Page id, URL (a URL is only one possible reference)

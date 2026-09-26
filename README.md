@@ -10,8 +10,12 @@ storage, and it ships as copyable source rather than a package.
 
 This is the tracer bullet (Linear FOR-439): a toggle, tap-to-comment anchored
 to the sentence under the tap, browser-only storage keyed by a page reference,
-and pins that survive a reload. Scope resizing, sentiment, replies, and a
-storage plug-in for hosted sites are later tickets.
+and pins that survive a reload. FOR-441 added a sentiment picker, an author
+and an open metadata slot the host can supply at init time, and editing and
+soft-deleting a comment from its pin. Scope resizing, replies, resolve/reopen
+and a storage plug-in for hosted sites are later tickets, and there is still
+no host login or permissions system: edit and delete are available on any
+comment's reopened sheet.
 
 ## Using it
 
@@ -37,6 +41,25 @@ or in setup code, which wins if both are present:
 ```
 
 Comments are stored in `localStorage`, keyed by the page reference.
+
+Optionally, tell comment mode who's commenting and attach the host's own
+metadata; both are stamped onto every comment created during that session:
+
+```html
+<script>
+  CommentMode.init({
+    pageReference: { id: 'my-page' },
+    author: { name: 'Ada Lovelace', id: 'user-42' }, // id is optional
+    meta: { team: 'design', ticket: 'FOR-441' } // an open slot, shape is yours
+  });
+</script>
+```
+
+When a comment is edited, its `sentiment` and `text` can change and an
+`updatedAt` timestamp is added; its `author`, `meta`, `createdAt` and `id`
+never change after creation. Deleting a comment marks it `deleted` rather
+than removing it from storage, so a delete is permanent (it never comes back
+on reload) but the record itself is kept.
 
 ## Running the tests
 
