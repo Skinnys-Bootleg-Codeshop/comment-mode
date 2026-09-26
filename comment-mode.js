@@ -723,6 +723,11 @@
         var text = textarea.value.trim();
         if (!text) return;
         if (isEdit) {
+          var changed = text !== comment.text || currentSentiment !== comment.sentiment;
+          if (!changed) {
+            closeSheet();
+            return;
+          }
           comment.text = text;
           comment.sentiment = currentSentiment;
           comment.updatedAt = new Date().toISOString();
@@ -734,8 +739,12 @@
             sentiment: currentSentiment,
             createdAt: new Date().toISOString()
           };
-          if (author) created.author = author;
-          if (meta !== undefined) created.meta = meta;
+          // Deep-copy author/meta so each comment holds an independent
+          // snapshot taken at creation time; the host may later mutate its
+          // own config object, and comments must not retroactively pick
+          // that up (see FOR-441 review).
+          if (author) created.author = JSON.parse(JSON.stringify(author));
+          if (meta !== undefined) created.meta = JSON.parse(JSON.stringify(meta));
           comments.push(created);
         }
         saveComments(storageKey, comments);

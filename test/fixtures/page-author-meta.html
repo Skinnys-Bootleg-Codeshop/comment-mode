@@ -4,18 +4,24 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="comment-mode:page-id" content="author-meta-fixture">
-<title>Comment mode fixture — author and meta</title>
+<title>Comment mode fixture: author and meta</title>
 </head>
 <body>
   <main>
     <p id="intro">This page configures an author and host metadata at init time.</p>
+    <p id="secondary">A second paragraph so a second comment can anchor elsewhere.</p>
   </main>
   <script src="/comment-mode.js"></script>
   <script>
-    window.commentModeInstance = window.CommentMode.init({
+    // Kept on window (rather than passed as an anonymous literal) so a test
+    // can mutate the host's own config object after init, the way a real
+    // host might, and confirm comment mode does not retroactively pick that
+    // up on comments already created.
+    window.cmConfig = {
       author: { name: 'Ada Lovelace', id: 'user-42' },
       meta: { team: 'design', ticket: 'FOR-441' }
-    });
+    };
+    window.commentModeInstance = window.CommentMode.init(window.cmConfig);
   </script>
 </body>
 </html>
