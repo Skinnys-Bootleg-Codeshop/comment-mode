@@ -18,9 +18,10 @@ control centre (`~/agentic-revolution/docs/how-we-work.md`).
 ## Commands
 
 - `npm test`: browser tests (`playwright test`) then node storage tests.
-- `npm run serve`: runs test/serve.js, the static server the browser tests use.
+- `npm run serve`: runs test/serve.js, the static server the browser tests use. Playwright starts it itself, so `npm test` needs no separate run.
 
 ## Conventions
 
 - Work is tracked in Linear, team FOR: the spec is FOR-438 and its tickets are children.
 - Keep `comment-mode.js` copyable: no imports, no package dependencies.
+- `examples/nextjs-upstash/public/comment-mode.js` is a copy of `comment-mode.js`: update it with the module. That example's own tests (`examples/nextjs-upstash/test`) are not part of the root `npm test`.
