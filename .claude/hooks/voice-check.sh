@@ -79,6 +79,7 @@ prose_files() {
     | sort -u \
     | grep -E '\.md$|^docs/.*\.html$' \
     | grep -v '^\.claude/skills/' \
+    | grep -v '^\.agents/skills/' \
     | grep -v '^\.claude/hooks/voice-regression\.md$' \
     | while IFS= read -r f; do [ -f "$f" ] && printf '%s\n' "$f"; done
 }
