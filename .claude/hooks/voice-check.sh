@@ -7,6 +7,8 @@
 #                   blocked, and reports anything a style edit must not change.
 #   --glossary      Reports words CONTEXT.md rules out, appearing in a changed
 #                   file name or heading. Read-only.
+#   --list          Prints the files a Stop run would ask about, one per line.
+#                   Read-only: writes neither the marker nor the snapshot.
 #
 # The failure it prevents: a style rewrite that changes what a sentence says.
 # One swapped word once turned three measured numbers into double what was
@@ -50,6 +52,14 @@ write_marker()  { printf '%s\n%s\n' "$(git rev-parse HEAD 2>/dev/null)" "$1" > "
 # first turn in a fresh checkout has no marker, so prose written, committed and
 # pushed inside that single turn is still compared against main and still slips.
 # Closing it needs a check that runs from a clean checkout, not a Stop hook.
+#
+# The marker alone also counted files that arrived by a fast-forward of a main
+# checkout or by a merge of main into a branch: the marker commit stays an ancestor,
+# so every file merged since then looked like this session's prose (incident #26).
+# prose_files now also requires the file to differ from the fork point with
+# origin/main (branch_files). That cannot reopen the push window above: every
+# project's block-direct-push.sh blocks pushing to main, and squash merges never make
+# a session's commits ancestors of origin/main, so its own prose still differs.
 base_commit() {
   if [ -n "${VOICE_CHECK_BASE:-}" ]; then
     printf '%s\n' "$VOICE_CHECK_BASE"
@@ -64,6 +74,20 @@ base_commit() {
   git merge-base origin/main HEAD 2>/dev/null || git rev-parse HEAD 2>/dev/null
 }
 
+# The files this branch carries that main does not: what differs from the fork point
+# with origin/main, plus untracked files. A fast-forwarded main checkout listed every
+# file other sessions had merged since the last check (incident #26); requiring a file
+# to be in this set as well keeps those out. Returns 1, printing nothing, when no such
+# filter applies: VOICE_CHECK_BASE is set, or there is no origin/main to fork from.
+branch_files() {
+  [ -z "${VOICE_CHECK_BASE:-}" ] || return 1
+  local fork
+  fork=$(git merge-base origin/main HEAD 2>/dev/null) || return 1
+  [ -n "$fork" ] || return 1
+  { git diff --name-only "$fork" 2>/dev/null
+    git ls-files --others --exclude-standard 2>/dev/null; } | sort -u
+}
+
 # Every Markdown file changed since that commit, plus HTML we authored. Skills are
 # excluded because they mostly still carry upstream's prose, and holding all of
 # that to our voice is not work we have chosen; captured specimens live outside
@@ -74,9 +98,17 @@ prose_files() {
   local base
   base=$(base_commit) || return
   [ -n "$base" ] || return
+  local mine
   { git diff --name-only "$base" 2>/dev/null
     git ls-files --others --exclude-standard 2>/dev/null; } \
     | sort -u \
+    | if mine=$(branch_files); then
+        # grep -Fxf with an empty pattern file keeps nothing, which is what an
+        # empty branch list means.
+        grep -Fxf <(printf '%s\n' "$mine") 2>/dev/null || true
+      else
+        cat
+      fi \
     | grep -E '\.md$|^docs/.*\.html$' \
     | grep -v '^\.claude/skills/' \
     | grep -v '^\.agents/skills/' \
@@ -193,6 +225,10 @@ report_scope_declarations() {
 }
 
 case "${1:-}" in
+--list)
+  prose_files
+  exit 0
+  ;;
 --glossary)
   hits=$(glossary_hits)
   if [ -n "$hits" ]; then printf '%s\n' "$hits"; report_scope_declarations; exit 1; fi
@@ -240,6 +276,9 @@ input=$(cat 2>/dev/null || true)
 files=$(prose_files)
 if [ -z "$files" ]; then
   write_marker "$(marker_hash)"
+  # A stale baseline would otherwise be compared against a later, unrelated edit of
+  # the same file.
+  rm -rf "$snapshot"
   exit 0
 fi
 
